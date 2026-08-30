@@ -58,7 +58,7 @@ Restartujte desku a v servisním režimu (nebo v konfigurátoru) zkontrolujte, �
 
 ### 2. Nastavte spotřebu
 
-Ventilátor čidla bere 90 mA a **nejde vypnout**. Při intervalu 5 min a měření prachu při každém probuzení to je zhruba **200 mAh/den**.
+Mezi měřeními deska čidlo odpojí od napájení (spínač uSup na GPIO47), takže tehdy nebere nic. Každé měření ale znamená roztočit ventilátor a nechat čidlo běžet asi 30 s, než je PM platné - po celou tu dobu do něj jde 90 mA. Při intervalu 5 min a měření prachu při každém probuzení to dělá zhruba **200 mAh/den**.
 
 ```
 senmult=3     PM a CO2 jen každé 3. probuzení (teplota zůstává po 5 min)
