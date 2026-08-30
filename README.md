@@ -81,10 +81,10 @@ Zbývá tedy jediné - zkalibrovat čidlo ručně:
 1. Vezměte desku ven, mimo dech a výfuky (venkovní vzduch je stabilně ~420 ppm).
 2. V servisním režimu zadejte  co2ref=420
 3. Čidlo poběží 3,5 minuty. Nechte ho v klidu na jednom místě.
-4. Vypíše se korekce v ppm. Uložte příkazem  save
+4. Vypíše se provedená korekce v ppm. Tím je hotovo.
 ```
 
-Korekce se ukládá do NVS **čidla**, takže přežije i odpojení napájení a nové nahrání firmwaru. Opakujte jednou za pár měsíců.
+Korekci si zapisuje do své NVS samo **čidlo**, takže přežije i odpojení napájení a nové nahrání firmwaru. Nic ukládat nemusíte - příkaz `save` se týká nastavení desky a na kalibraci CO₂ nemá vliv. Opakujte jednou za pár měsíců.
 
 Máte-li barometr (BME/BMP280), tlak se posílá do čidla automaticky jako vstup pro kompenzaci CO₂. Bez barometru nastavte `alt=<metry>`.
 
