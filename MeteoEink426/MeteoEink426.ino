@@ -1,5 +1,5 @@
 /*
- * MeteoEink426 v4 — LaskaKit ESPink-4.26 (ESP32-S3, ePaper GDEQ0426T82 800x480)
+ * MeteoEink426 v4.3.0 — LaskaKit ESPink-4.26 (ESP32-S3, ePaper GDEQ0426T82 800x480)
  * ============================================================================
  * Offline meteostanice s autodetekci vice cidel a volitelnymi kanaly grafu.
  *
