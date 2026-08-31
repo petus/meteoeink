@@ -1,5 +1,5 @@
 /*
- * MeteoEink426 v4.3.0 — LaskaKit ESPink-4.26 (ESP32-S3, ePaper GDEQ0426T82 800x480)
+ * MeteoEink426 v4 — LaskaKit ESPink-4.26 (ESP32-S3, ePaper GDEQ0426T82 800x480)
  * ============================================================================
  * Offline meteostanice s autodetekci vice cidel a volitelnymi kanaly grafu.
  *
@@ -106,7 +106,7 @@
 // duvod viz varovani v sekci VELICINY A CIDLA.
 // ============================================================================
 #define FW_NAME     "MeteoEink426"
-#define FW_VERSION  "4.3.0"
+#define FW_VERSION  "4.3.2"
 
 // ============================================================================
 // SYMBOLY, KTERE FONTY ADAFRUIT GFX NEMAJI
@@ -167,6 +167,7 @@
 #define VBAT_LOW          3.50f    // varovani na displeji
 #define VBAT_NO_WRITE     3.30f    // pod tim uz nezapisovat do flash
 
+#define BTN_WINDOW_MS     600      // jak dlouho po startu cekat na stisk
 #define SERVICE_HOLD_MS   2000     // PUSH 2-5 s: servis pres USB
 #define AP_HOLD_MS        5000     // PUSH >= 5 s: WiFi hotspot s konfiguraci
 #define CLEAR_HOLD_MS     5000     // DOWN 5 s: smazani historie
@@ -1990,6 +1991,53 @@ static void mergeSources(Reading &r) {
   // Tlak umi jen barometr; r.press uz ma prepocet i offset z readBosch().
 }
 
+// ---------------------------------------------------------------------------
+// POSLEDNI HODNOTY ZE SEN6x PRO DISPLEJ
+//
+// Cidlo bezi jen kazde cfg.senMult-te probuzeni, ale displej se prekresluje
+// pri kazdem. Bez teto pameti by v preskocenych cyklech svitily u CO2, prachu
+// a (pri tsrc=sen) i u hlavni teploty pomlcky misto cisla, ktere je stare par
+// minut. Uzivatel by videl "--" u dvou obnoveni ze tri.
+//
+// DO HISTORIE SE TO NEPOUZIVA. Tam mezera zustat MUSI - jinak by graf dostal
+// falesne zdvojene vzorky a casova osa by lhala. Proto se funkce vola az za
+// histPush(), tesne pred vykreslenim.
+// ---------------------------------------------------------------------------
+RTC_DATA_ATTR float lastSenT = NAN, lastSenH = NAN, lastSenCo2 = NAN;
+RTC_DATA_ATTR float lastPm1 = NAN, lastPm25 = NAN, lastPm4 = NAN, lastPm10 = NAN;
+RTC_DATA_ATTR uint16_t lastSenAge = 0;     // kolik cyklu je udaj stary
+
+static void senCarryForDisplay(Reading &r) {
+  if (!det.sen6x) return;
+
+  if (r.senFresh) {                        // cerstve mereni - jen si ho ulozime
+    lastSenT   = r.tSen;   lastSenH  = r.hSen;  lastSenCo2 = r.co2Sen;
+    lastPm1    = r.pm1;    lastPm25  = r.pm25;
+    lastPm4    = r.pm4;    lastPm10  = r.pm10;
+    lastSenAge = 0;
+    return;
+  }
+
+  // Drzime jen po dobu ocekavaneho preskoceni. Kdyz cidlo vypadne nadobro,
+  // ma se na displeji objevit pomlcka, ne cislo stare hodiny.
+  uint16_t maxAge = cfg.senMult ? cfg.senMult : 1;
+  if (lastSenAge >= maxAge) return;
+  lastSenAge++;
+
+  if (isnan(r.tSen))   r.tSen   = lastSenT;
+  if (isnan(r.hSen))   r.hSen   = lastSenH;
+  if (isnan(r.co2Sen)) r.co2Sen = lastSenCo2;
+  if (isnan(r.pm1))    r.pm1    = lastPm1;
+  if (isnan(r.pm25))   r.pm25   = lastPm25;
+  if (isnan(r.pm4))    r.pm4    = lastPm4;
+  if (isnan(r.pm10))   r.pm10   = lastPm10;
+
+  // Slozene hodnoty (temp, hum, co2) se musi prepocitat - pri tsrc=sen nebo
+  // bez SCD41 z nich teprve ted neco je. mergeSources() jen prirazuje,
+  // takze druhe volani nic nezdvoji.
+  mergeSources(r);
+}
+
 Reading doMeasurement() {
   Reading r;
   // Baterie se cte jako prvni, jeste bez zateze ventilatoru - jinak by
@@ -2424,6 +2472,46 @@ static float niceCeil(float v) {
   return n * mag;
 }
 
+// ---------------------------------------------------------------------------
+// TYPICKY ROZESTUP VZORKU KANALU
+//
+// Ne kazdy kanal se meri pri kazdem probuzeni. SEN6x bezi jen kazde
+// cfg.senMult-te, takze VSECHNY jeho veliciny - pm25, pm10, co2 (kdyz neni
+// SCD41), temp.sen, hum.sen a taky hlavni temp/hum pri tsrc=sen / hsrc=sen -
+// maji v historii pravidelne mezery. Kdyby se spojovaly jen sousedni vzorky,
+// rozpadl by se takovy prubeh na radu puntiku.
+//
+// Hleda se NEJCASTEJSI mezera, ne nejmensi. Po vypadku napajeni se pocitadlo
+// senTick vynuluje a faze se posune, takze v historii vznikne jedna kratsi
+// mezera - a ta by jako minimum rozhodla za celou historii.
+//
+// Mezery delsi nez GAP_MAX se neprekleuji: to uz neni rozestup mereni, ale
+// vypadek cidla, a spojit ho carou by lhalo.
+// ---------------------------------------------------------------------------
+#define GAP_MAX 32
+
+static uint16_t histStep(uint8_t ch) {
+  if (ch >= channelCount) return 1;
+  const Quantity q = channels[ch].q;
+  uint16_t occur[GAP_MAX + 1];
+  for (uint16_t g = 0; g <= GAP_MAX; g++) occur[g] = 0;
+
+  int32_t prev = -1;
+  for (uint16_t i = 0; i < histCount; i++) {
+    if (isnan(storeToVal(q, histAt(ch, i)))) continue;
+    if (prev >= 0) {
+      int32_t g = (int32_t)i - prev;
+      if (g >= 1 && g <= GAP_MAX) occur[g]++;
+    }
+    prev = (int32_t)i;
+  }
+
+  uint16_t best = 1, bestN = 0;
+  for (uint16_t g = 1; g <= GAP_MAX; g++)
+    if (occur[g] > bestN) { bestN = occur[g]; best = g; }
+  return bestN ? best : 1;
+}
+
 void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
   const int gBottom = gy + gh, gRight = gx + gw;
   Quantity q = channels[ch].q;
@@ -2590,33 +2678,34 @@ void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
 
   // --- prubeh: silnejsi cara (dva pixely vedle sebe) ---
   //
-  // OSAMOCENE VZORKY: prach a CO2 se pri nasobku intervalu (senmult) meri
-  // rid[c]eji nez zbytek, takze mezi nimi jsou v historii mezery. Samotny bod
-  // obklopeny mezerami nema s cim spojit caru a driv se nevykreslil vubec -
-  // graf pak zustal prazdny, i kdyz data byla. Takovy vzorek proto kreslime
-  // jako pu[n]tik.
+  // Kanal merený rid[c]eji nez ostatni (SEN6x pri senmult > 1) ma mezi vzorky
+  // pravidelne mezery. Spojujeme proto i pres ne, az do typickeho rozestupu
+  // kanalu - viz histStep(). Puntik zbyva jen na vzorek, ktery opravdu nema
+  // souseda: jedno mereni po delsim vypadku cidla.
+  const uint16_t step = histStep(ch);
   int px = -1, py = -1;
-  bool prevValid = false;
+  int32_t prevIdx = -1;
+  bool prevJoined = false;
   for (uint16_t i = 0; i < histCount; i++) {
     float v = storeToVal(q, histAt(ch, i));
-    if (isnan(v)) { px = -1; prevValid = false; continue; }
+    if (isnan(v)) continue;
     int x = xFor(i), y = yFor(v);
 
-    bool nextValid = false;
-    if (i + 1 < histCount) nextValid = !isnan(storeToVal(q, histAt(ch, i + 1)));
-
-    if (prevValid) {
+    bool joined = (prevIdx >= 0 && ((int32_t)i - prevIdx) <= (int32_t)step);
+    if (joined) {
       if (channels[ch].dashed) {
         drawDashedLine(px, py, x, y, 5, 4);
       } else {
         display.drawLine(px, py, x, y, GxEPD_BLACK);
         display.drawLine(px, py - 1, x, y - 1, GxEPD_BLACK);   // tloustka 2 px
       }
-    } else if (!nextValid) {
-      display.fillCircle(x, y, 2, GxEPD_BLACK);   // vzorek bez sousedu
+    } else if (prevIdx >= 0 && !prevJoined) {
+      display.fillCircle(px, py, 2, GxEPD_BLACK);   // predchozi zustal sam
     }
-    px = x; py = y; prevValid = true;
+    px = x; py = y; prevIdx = (int32_t)i; prevJoined = joined;
   }
+  // Posledni vzorek uz nema naslednika, ktery by ho vykreslil.
+  if (prevIdx >= 0 && !prevJoined) display.fillCircle(px, py, 2, GxEPD_BLACK);
 }
 
 // Zapati s verzi firmwaru. Drzi se uplne dole, aby si nekonkurovalo
@@ -3347,9 +3436,9 @@ min-height:34px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 </div></div>
 
 <div class="p hd" id="pCo2"><h2>CO2</h2><div class="b">
-<div class="r"><label>Automatická samokalibrace</label>
+<div class="r hd" id="rAsc"><label>Automatická samokalibrace</label>
 <input type=checkbox id=asc style="width:20px;height:20px;accent-color:var(--ac)"></div>
-<p class="wn" id="ascwn"></p>
+<p class="wn hd" id="ascwn"></p>
 <div class="r"><label>Kalibrovat na hodnotu [ppm]</label>
 <input type=number id=co2ref step=5 min=300 max=2000 value=420></div>
 <div class="acts"><button class="pr" onclick="applyCo2(this)">Použít</button>
@@ -3522,10 +3611,17 @@ g("rP").className=hasP?"r":"r hd";g("rA").className=hasP?"r":"r hd";
 g("pSen").className=S.sen?"p":"p hd";g("cSen").className=S.sen?"c":"c hd";
 g("pCo2").className=((S.srcC||"-")!=="-")?"p":"p hd";
 g("asc").checked=!!S.asc;
-// Samokalibrace pocita s nepretrzitym behem, ktery se s uspavanim vylucuje.
-g("ascwn").textContent=S.asc?"Samokalibrace hleda tydenni minimum a potřebuje"
-+" nepřetržitý běh. Při měření po intervalech ji raději vypněte a jednou za čas"
-+" použijte kalibraci na 420 ppm.":"";
+// Samokalibrace se u SEN6x vůbec nenabízí: deska čidlo mezi měřeními odpojuje
+// od napájení a ASC hledá týdenní minimum za nepřetržitého běhu, takže nemá
+// jak fungovat - podle datasheetu může přesnost i zhoršit. Zbývá ruční
+// kalibrace na 420 ppm o řádek níž. U SCD41 volbu necháváme.
+// Zapnutou ASC ukážeme i u SEN6x - jinak by ji nešlo z hotspotu vypnout.
+var ascOk=(S.srcC==="SCD41")||!!S.asc;
+g("rAsc").className=ascOk?"r":"r hd";
+g("ascwn").className=(ascOk&&S.asc)?"wn":"wn hd";
+g("ascwn").textContent=(ascOk&&S.asc)?"Samokalibrace hledá týdenní minimum"
++" a potřebuje nepřetržitý běh. Při měření po intervalech ji raději vypněte"
++" a jednou za čas použijte kalibraci na 420 ppm.":"";
 g("sT").textContent=S.srcT||"—";g("sH").textContent=S.srcH||"—";
 g("sC").textContent=S.srcC||"—";g("sP").textContent=S.srcP||"—";
 if(S.sen){if(document.activeElement!==g("senwarm"))g("senwarm").value=S.senwarm;
@@ -3630,18 +3726,31 @@ function drawG(cv,ci){var dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.c
   x.fillText(fb(GD.rows[idx][0]),Math.min(Math.max(pl+gw*i/2,22),w-22),h-4)}
  var XP=function(i){return pl+(GD.rows.length<=1?gw:gw*i/(GD.rows.length-1))};
  var YP=function(v){return pt+gh-(v-mn)/(mx-mn)*gh};
- x.strokeStyle="#ffb524";x.lineWidth=2;x.lineJoin="round";x.beginPath();var st=false;
- GD.rows.forEach(function(r,i){var v=r[ci+1];if(v===null||isNaN(v)){st=false;return}
-  var px=XP(i),py=YP(v);if(!st){x.moveTo(px,py);st=true}else x.lineTo(px,py)});
+ // SEN6x běží jen každé senmult-té probuzení, takže všechny jeho veličiny
+ // (pm25, pm10, co2 bez SCD41, temp.sen, hum.sen i hlavní temp/hum při
+ // tsrc=sen) mají v historii pravidelné mezery. Spojujeme proto i přes ně,
+ // až do typického rozestupu kanálu. Bere se NEJČASTĚJŠÍ mezera, ne nejmenší -
+ // po výpadku napájení se fáze posune a jedna kratší mezera by jinak
+ // rozhodla za celou historii. Delší než 32 je výpadek čidla, ne rozestup.
+ var GAPMAX=32,ix=[];
+ GD.rows.forEach(function(r,i){var v=r[ci+1];if(v!==null&&!isNaN(v))ix.push(i)});
+ var step=1;
+ if(ix.length>1){var oc=new Array(GAPMAX+1).fill(0),bn=0;
+  for(var k=1;k<ix.length;k++){var g=ix[k]-ix[k-1];if(g>=1&&g<=GAPMAX)oc[g]++}
+  for(var g2=1;g2<=GAPMAX;g2++)if(oc[g2]>bn){bn=oc[g2];step=g2}
+  if(!bn)step=1}
+ x.strokeStyle="#ffb524";x.lineWidth=2;x.lineJoin="round";x.beginPath();
+ var lone=new Array(ix.length).fill(true);
+ for(var k2=0;k2<ix.length;k2++){var i2=ix[k2];
+  if(k2>0&&(i2-ix[k2-1])<=step){lone[k2]=false;lone[k2-1]=false;
+   x.lineTo(XP(i2),YP(GD.rows[i2][ci+1]))}
+  else x.moveTo(XP(i2),YP(GD.rows[i2][ci+1]))}
  x.stroke();
- // Osamocené vzorky: prach a CO2 se při násobku intervalu měří řidčeji, takže
- // mezi nimi jsou mezery. Samotný bod nemá s čím spojit čáru a bez puntíku by
- // se nevykreslil vůbec - graf pak vypadá prázdný, i když data jsou.
+ // Puntík zbývá jen na vzorek, který opravdu nemá souseda - jedno měření po
+ // delším výpadku čidla. Bez něj by se nevykreslil vůbec.
  x.fillStyle="#ffb524";
- GD.rows.forEach(function(r,i){var v=r[ci+1];if(v===null||isNaN(v))return;
-  var pv2=i>0?GD.rows[i-1][ci+1]:null,nv=i<GD.rows.length-1?GD.rows[i+1][ci+1]:null;
-  var lone=(pv2===null||isNaN(pv2))&&(nv===null||isNaN(nv));
-  if(lone){x.beginPath();x.arc(XP(i),YP(v),2.5,0,6.284);x.fill()}});
+ for(var k4=0;k4<ix.length;k4++){if(!lone[k4])continue;var i4=ix[k4];
+  x.beginPath();x.arc(XP(i4),YP(GD.rows[i4][ci+1]),2.5,0,6.284);x.fill()}
  if(cv._c!==undefined&&cv._c!==null){var i=cv._c;
   var px=pl+(GD.rows.length<=1?gw:gw*i/(GD.rows.length-1));
   x.globalAlpha=.55;x.lineWidth=1;x.beginPath();x.moveTo(px+.5,pt);x.lineTo(px+.5,pt+gh);x.stroke();
@@ -4182,6 +4291,63 @@ void setup() {
 
   Serial.printf("\n%s v%s (build %s)\n", FW_NAME, FW_VERSION, fwBuildDate());
 
+  // --- Tlacitka po restartu: MERI SE HNED, jeste pred detekci cidel ---
+  //
+  // PUSH pusteno mezi 2-5 s = servis pres USB
+  // PUSH drzeno >= 5 s      = WiFi hotspot s konfiguraci
+  // DOWN drzeno >= 5 s      = smazani historie
+  //
+  // POZOR, tohle musi zustat uplne na zacatku. Driv se tlacitko cetlo az za
+  // detectSensors() a loadHistory(), tedy stovky milisekund az pres sekundu
+  // po resetu - a doba stisku se pocitala teprve od te chvile. Kdo drzel PUSH
+  // od resetu a pustil ho po dvou a pul sekundach, mel namereno jen neco pres
+  // sekundu a servis se nespustil. Delka detekce navic kolisa podle toho, jaka
+  // cidla jsou pripojena, takze to jednou vyslo a podruhe ne.
+  //
+  // Vlastni akce se provede az nize, po nacteni cidel a historie - servisni
+  // rezim je potrebuje pro 'list' a 'dump'.
+  bool wantHotspot = false, wantService = false, wantClear = false;
+  if (hardStart) {
+    pinMode(BTN_PUSH, INPUT_PULLUP);
+    pinMode(BTN_DOWN, INPUT_PULLUP);
+    delay(20);                              // ustaleni pull-upu
+
+    // Kratke okno na stisk. Kdo drzi tlacitko uz pri resetu, trefi se hned;
+    // kdo ho stiskne tesne po nem, ma jeste chvili. Ceka se jen pri tvrdem
+    // startu, takze to nestoji nic pri beznem probuzeni casovacem.
+    uint32_t tw = millis();
+    while (digitalRead(BTN_PUSH) == HIGH && digitalRead(BTN_DOWN) == HIGH &&
+           millis() - tw < BTN_WINDOW_MS) delay(10);
+
+    if (digitalRead(BTN_PUSH) == LOW) {
+      Serial.printf("PUSH: pust mezi %d-%d s = servis, drz pres %d s = WiFi...\n",
+                    SERVICE_HOLD_MS / 1000, AP_HOLD_MS / 1000, AP_HOLD_MS / 1000);
+      // Merime az do pusteni, nejdele vsak AP_HOLD_MS.
+      uint32_t t0 = millis();
+      while (digitalRead(BTN_PUSH) == LOW && millis() - t0 < AP_HOLD_MS) delay(10);
+      uint32_t held = millis() - t0;
+
+      if (held >= AP_HOLD_MS) {
+        wantHotspot = true;                 // spusti se az po zmereni baterie
+        Serial.println("PUSH >= 5 s - spoustim WiFi hotspot.");
+      } else if (held >= SERVICE_HOLD_MS) {
+        wantService = true;
+        Serial.printf("PUSH drzeno %lu ms - spoustim servis.\n",
+                      (unsigned long)held);
+      } else {
+        Serial.printf("PUSH pusteno po %lu ms (potreba %d ms) -"
+                      " pokracuji v mereni.\n",
+                      (unsigned long)held, SERVICE_HOLD_MS);
+      }
+    }
+    else if (digitalRead(BTN_DOWN) == LOW) {
+      Serial.printf("DOWN drzeno - podrz %d s pro smazani historie...\n",
+                    CLEAR_HOLD_MS / 1000);
+      if (holdFor(BTN_DOWN, CLEAR_HOLD_MS)) wantClear = true;
+      else Serial.println("DOWN pusteno prilis brzy - historie zachovana.");
+    }
+  }
+
   powerOn();
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   // SEN6x zvlada nejvys 100 kbit/s. Ostatni cidla na desce se stejnou
@@ -4199,54 +4365,27 @@ void setup() {
   // videly (prikazy list/dump by jinak hlasily 0 vzorku).
   loadHistory(sig);
 
-  // --- Tlacitka po restartu ---
-  // PUSH pusteno mezi 2-5 s = servis pres USB
-  // PUSH drzeno >= 5 s      = WiFi hotspot s konfiguraci
-  // DOWN drzeno >= 5 s      = smazani historie
-  bool wantHotspot = false;
-  if (hardStart) {
-    pinMode(BTN_PUSH, INPUT_PULLUP);
-    pinMode(BTN_DOWN, INPUT_PULLUP);
-    delay(20);                              // ustaleni pull-upu
-
-    if (digitalRead(BTN_PUSH) == LOW) {
-      Serial.printf("PUSH: pust mezi %d-%d s = servis, drz pres %d s = WiFi...\n",
-                    SERVICE_HOLD_MS / 1000, AP_HOLD_MS / 1000, AP_HOLD_MS / 1000);
-      // Merime az do puštění, nejdele vsak AP_HOLD_MS.
-      uint32_t t0 = millis();
-      while (digitalRead(BTN_PUSH) == LOW && millis() - t0 < AP_HOLD_MS) delay(10);
-      uint32_t held = millis() - t0;
-
-      if (held >= AP_HOLD_MS) {
-        wantHotspot = true;                 // spusti se az po zmereni baterie
-        Serial.println("PUSH >= 5 s - spoustim WiFi hotspot.");
-      } else if (held >= SERVICE_HOLD_MS) {
-        allowLightSleep = false;     // v servisu bezi USB konzole
-        runService();
-        cfgLoad();
-        buildChannels();
-        sig = buildSignature();
-        rtcSignature = sig;        // zmeny v servisu jsou vedome
-        // Kdyz uzivatel v servisu menil ch nebo int a pak nechal dobehnout
-        // timeout bez ulozeni, zustane histSlots od docasneho rozlozeni.
-        // Bez teto kontroly by nesoulad prezil do dalsiho bootu.
-        if (histSlots != histPerCh) histClear();
-      } else {
-        Serial.println("PUSH pusteno prilis brzy - pokracuji v mereni.");
-      }
-    }
-    else if (digitalRead(BTN_DOWN) == LOW) {
-      Serial.printf("DOWN drzeno - podrz %d s pro smazani historie...\n",
-                    CLEAR_HOLD_MS / 1000);
-      if (holdFor(BTN_DOWN, CLEAR_HOLD_MS)) {
-        histClear();
-        histEraseNVS();
-        rtcSignature = sig;
-        Serial.println("Historie smazana (DOWN).");
-      } else {
-        Serial.println("DOWN pusteno prilis brzy - historie zachovana.");
-      }
-    }
+  // --- Vyhodnoceni tlacitek ---
+  // Samotne MERENI doby stisku uz probehlo na zacatku setup(), viz tam.
+  // Tady se jen provede, co si uzivatel vyzadal - az ted jsou nactena cidla
+  // i historie, ktere servisni rezim potrebuje pro 'list' a 'dump'.
+  if (wantService) {
+    allowLightSleep = false;     // v servisu bezi USB konzole
+    runService();
+    cfgLoad();
+    buildChannels();
+    sig = buildSignature();
+    rtcSignature = sig;          // zmeny v servisu jsou vedome
+    // Kdyz uzivatel v servisu menil ch nebo int a pak nechal dobehnout
+    // timeout bez ulozeni, zustane histSlots od docasneho rozlozeni.
+    // Bez teto kontroly by nesoulad prezil do dalsiho bootu.
+    if (histSlots != histPerCh) histClear();
+  }
+  if (wantClear) {
+    histClear();
+    histEraseNVS();
+    rtcSignature = sig;
+    Serial.println("Historie smazana (DOWN).");
   }
 
   // --- Mereni ---
@@ -4306,6 +4445,11 @@ void setup() {
                   qValue(r, Q_T_SEN), qValue(r, Q_H_SEN), r.hcho);
 
   histPush(r);
+
+  // AZ TED, po zapisu do historie: doplnime na displej posledni znamou
+  // hodnotu ze SEN6x, kdyz cidlo v tomto cyklu nebezelo. Historie uz ma
+  // svoji mezeru, takze graf zustane poctivy.
+  senCarryForDisplay(r);
 
   // Zapis do NVS jen obcas (opotrebeni flash) a ne pri podpeti.
   // Zapis do NVS: prvni vzorky ulozime hned, aby se pri restartu hned po
