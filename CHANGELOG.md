@@ -1,5 +1,53 @@
 # MeteoEink426 - changelog
 
+## v4.3.2
+
+Konfigurace i historie zůstávají.
+
+- **Opraveno: servisní režim se často nespustil napoprvé.** Stav tlačítka se
+  četl až za `detectSensors()` a `loadHistory()`, tedy stovky milisekund až
+  přes sekundu po restartu - a doba stisku se počítala teprve od té chvíle.
+  Kdo držel PUSH od resetu a pustil ho po dvou a půl sekundách, měl naměřeno
+  jen něco přes sekundu. Délka detekce navíc kolísá podle připojených čidel,
+  takže to jednou vyšlo a podruhé ne. Tlačítka se teď vyhodnocují hned na
+  začátku `setup()`, ještě před detekcí; vlastní akce se provede až potom,
+  kdy jsou čidla i historie načtená. Přibylo krátké okno 600 ms, aby se
+  trefil i stisk těsně po resetu. Výpis nově uvádí naměřenou dobu v ms.
+- **Displej už neukazuje `--` v přeskočených cyklech.** Při `senmult > 1`
+  běží SEN6x jen každé N-té probuzení, ale displej se překresluje při každém,
+  takže u CO₂, prachu a při `tsrc=sen` i u hlavní teploty svítily pomlčky.
+  Nově se použije poslední známá hodnota. **Do historie se nepřenáší** -
+  tam mezera zůstat musí, jinak by graf dostal falešné zdvojené vzorky.
+  Drží se jen po dobu očekávaného přeskočení; když čidlo vypadne nadobro,
+  pomlčky se objeví.
+- **Samokalibrace CO₂ se u SEN6x na webu nenabízí.** Při odpojovaném napájení
+  nemá jak fungovat. Volba zůstává, když CO₂ dodává SCD41, a taky když ji
+  někdo má zapnutou ze starší konfigurace - jinak by ji nešlo z webu vypnout.
+  Platí pro konfigurátor i hotspot.
+
+---
+
+## v4.3.1
+
+Konfigurace i historie zůstávají.
+
+- **Opraveno: graf veličiny ze SEN6x se kreslil jako řada teček.** Týkalo se
+  všeho, co dodává SEN6x - `temp.sen`, `hum.sen`, `pm25`, `pm10`, `co2` bez
+  SCD41 i hlavní `temp`/`hum` při `tsrc=sen`/`hsrc=sen`. Při `senmult > 1`
+  běží čidlo jen každé N-té probuzení, takže má v historii pravidelné mezery,
+  a vykreslování spojovalo jen sousední vzorky. Nově se zjistí typický
+  rozestup vzorků kanálu a mezery do této délky se přemostí čarou. Tečka
+  zbývá jen na vzorek, který opravdu nemá souseda, tedy jedno měření po
+  delším výpadku čidla.
+- Rozestup se bere jako **nejčastější** mezera, ne nejmenší. Po výpadku
+  napájení se `senTick` vynuluje a fáze se posune, takže v historii vznikne
+  jedna kratší mezera - jako minimum by rozhodla za celou historii.
+- Mezery delší než 32 vzorků se nepřemosťují. To už není rozestup měření,
+  ale výpadek čidla, a spojit ho čarou by lhalo.
+- Opraveno shodně ve firmwaru, ve webovém konfigurátoru i v hotspotu.
+
+---
+
 ## v4.3.0
 
 Konfigurace zůstává (`CFG_MAGIC` = `MEK7`). Kdo už má uloženou konfiguraci,
