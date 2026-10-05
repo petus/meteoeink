@@ -13,7 +13,7 @@ Podrobný článek: <https://chiptron.cz/prenosna-offline-meteostanice-s-jednodu
 - Měří teplotu, vlhkost, CO₂, prach (PM2.5 / PM10) a tlak - podle toho, jaká čidla jsou připojená.
 - **Čidla se detekují automaticky** při startu. Připojení nebo odebrání čidla nevyžaduje překompilování firmwaru.
 - Vykresluje aktuální hodnoty a až **4 grafy historie** přímo na e-ink displej.
-- **Každé čidlo má vlastní veličinu**, takže jde porovnat třeba teplotu ze SHT40 a ze SEN63C v jednom grafu. Zároveň si volíte, které čidlo dodává hlavní hodnotu na displeji.
+- **Každé čidlo má vlastní veličinu**, takže jde porovnat třeba teplotu ze SHT40 a ze SEN63C - buď každou ve svém grafu, nebo obě v jednom. Zároveň si volíte, které čidlo dodává hlavní hodnotu na displeji.
 - Historie se ukládá lokálně a **přežije vybití i restart** (RTC RAM + NVS).
 - Mezi měřeními je deska v deep sleepu - při rozumném intervalu vydrží baterie týdny.
 - Konfigurace přes web (USB nebo WiFi hotspot), export dat do CSV.
@@ -36,7 +36,7 @@ I2C čidla se připojují konektorem **uSup** (kompatibilní se SparkFun Qwiic /
 
 ### Délka historie
 
-Paměť je společný pool - čím méně kanálů grafu a delší interval, tím delší historie.
+Paměť je společný pool - čím méně kanálů grafu a delší interval, tím delší historie. Rozhoduje počet **kanálů**, ne počet grafů: sloučení dvou veličin do jednoho grafu historii neprodlouží.
 
 | Interval | 1 kanál | 2 kanály | 3 kanály | 4 kanály |
 |---|---|---|---|---|
@@ -54,51 +54,96 @@ Paměť je společný pool - čím méně kanálů grafu a delší interval, tí
 
 ### 1. Ověřte detekci
 
-Restartujte desku a v servisním režimu (nebo v konfigurátoru) zkontrolujte, že se objevil řádek `SEN6x: SEN63C sn 0x...`. Pokud je na `0x6B` čidlo, které firmware nezná, napíše to.
+Restartujte desku a v konfigurátoru (USB nebo WiFi) zkontrolujte, že se mezi čidly objevil SEN63C nebo SEN66.
 
 ### 2. Nastavte spotřebu
 
 Mezi měřeními deska čidlo odpojí od napájení (spínač uSup na GPIO47), takže tehdy nebere nic. Každé měření ale znamená roztočit ventilátor a nechat čidlo běžet asi 30 s, než je PM platné - po celou tu dobu do něj jde 90 mA. Při intervalu 5 min a měření prachu při každém probuzení to dělá zhruba **200 mAh/den**.
 
-```
-senmult=3     PM a CO2 jen každé 3. probuzení (teplota zůstává po 5 min)
-senwarm=30    doba běhu před odečtem; méně než 30 s = podhodnocené PM
-lsleep=1      ESP32 spí během zahřívání čidla (~1 mA místo 40 mA)
-```
+V konfigurátoru v sekci **Čidlo prachu SEN6x** nastavte:
 
-`list` vypíše odhad denní spotřeby podle aktuálního nastavení, stejně tak konfigurátor.
+- **Interval pro prach a CO₂**, např. každé 3. měření. Teplota a vlhkost se měří dál podle základního intervalu.
+- **Doba běhu před odečtem** 30 s. Kratší doba dává podhodnocené PM.
+- **Uspat desku během zahřívání** zapnuto. ESP32 pak během zahřívání čidla bere asi 1 mA místo 40 mA.
+
+Konfigurátor ukáže odhad denní spotřeby podle aktuálního nastavení.
 
 ### 3. Zkalibrujte CO₂ - tohle je nutné
 
 Deska čidlo mezi měřeními odpojuje od napájení, což má dva důsledky:
 
-- **Automatická samokalibrace (ASC) nefunguje.** Datasheet: *„for power-cycled single shot operation, ASC is not available."* Nechte ji vypnutou (`asc=0`, od v4.3.0 výchozí).
-- **Deklarovaná přesnost platí až po dlouhém souvislém běhu** - 12 h u SEN63C, 2 dny u SEN66. Na baterii toho nedosáhnete.
+- **Automatická samokalibrace (ASC) nefunguje.** Datasheet: *„for power-cycled single shot operation, ASC is not available."* Nechte ji vypnutou (od v4.3.0 výchozí).
+- **Deklarovaná přesnost platí až po dlouhém souvislém běhu**, 12 h u SEN63C, 2 dny u SEN66. Na baterii toho nedosáhnete.
 
-Zbývá tedy jediné - zkalibrovat čidlo ručně:
-
-```
-1. Vezměte desku ven, mimo dech a výfuky (venkovní vzduch je stabilně ~420 ppm).
-2. V servisním režimu zadejte  co2ref=420
-3. Čidlo poběží 3,5 minuty. Nechte ho v klidu na jednom místě.
-4. Vypíše se provedená korekce v ppm. Tím je hotovo.
-```
-
-Korekci si zapisuje do své NVS samo **čidlo**, takže přežije i odpojení napájení a nové nahrání firmwaru. Nic ukládat nemusíte - příkaz `save` se týká nastavení desky a na kalibraci CO₂ nemá vliv. Opakujte jednou za pár měsíců.
-
-Máte-li barometr (BME/BMP280), tlak se posílá do čidla automaticky jako vstup pro kompenzaci CO₂. Bez barometru nastavte `alt=<metry>`.
+Čidlo proto zkalibrujte ručně, postup je níže v kapitole **Kalibrace CO₂**.
 
 ### 4. Zkompenzujte teplotu
 
-SEN6x se sám ohřívá a jeho teplota bývá o 1-3 °C nad skutečnou. Porovnejte s referenčním teploměrem a nastavte `toff.sen=<rozdíl>`. Pokud chcete teplotu z jiného čidla, přepněte `tsrc=sht` (nebo `tsrc=ds` pro sondu na kabelu).
+SEN6x se sám ohřívá a jeho teplota bývá o 1-3 °C nad skutečnou. Porovnejte s referenčním teploměrem a rozdíl nastavte v konfigurátoru v sekci **Kompenzace měření** jako offset teploty SEN6x. Pokud chcete hlavní teplotu z jiného čidla (SHT40 nebo sondy DS18B20 na kabelu), zvolte ho v sekci **Hlavní teplota a vlhkost**.
 
 ### 5. Nechte zapnuté čištění ventilátoru
 
-`senauto=7` (výchozí) pročistí ventilátor jednou týdně. `senclean` spustí čištění hned při dalším měření.
+**Automatické čištění ventilátoru** po 7 dnech (výchozí) pročistí ventilátor jednou týdně. Tlačítko **Naplánovat pročištění** ho spustí hned při dalším měření.
 
 ### Co čekat
 
 Trend CO₂ (vyvětráno / dusno) je po kalibraci spolehlivý, absolutní hodnotu berte s rezervou. **První měření po nahrání firmwaru není směrodatné.**
+
+---
+
+## Kalibrace CO₂
+
+Platí pro SCD41 i SEN6x. Kalibruje se čidlo, které dodává CO₂ (je-li v sestavě SCD41, je to on). Kalibrace je FRC (forced recalibration): čidlo dostane referenční koncentraci a rozdíl proti svému údaji si uloží jako korekci. Venkovní vzduch má přibližně 420 ppm.
+
+### Před kalibrací
+
+V konfigurátoru nastavte **nadmořskou výšku**. Bez ní čidlo počítá s tlakem u hladiny moře a ve 250 m n. m. měří asi o 3 % méně. Máte-li barometr (BME/BMP280), posílá se do čidla místo výšky naměřený tlak, automaticky.
+
+### Postup
+
+1. Naplánujte kalibraci:
+   - **USB:** v konfigurátoru v řádku **Kalibrace CO₂** nechte 420 ppm, klikněte na **Použít** a pak dole na **Uložit a ukončit servis**.
+   - **WiFi:** na stránce hotspotu v panelu CO₂ nechte 420 a klikněte na **Kalibrovat**, pak dole na **Uložit a vypnout hotspot**. Tlačítko **Použít** v tom panelu patří k samokalibraci, pro kalibraci ho nepotřebujete.
+2. Začne **odklad**, výchozí 90 s, na displeji *Odneste desku* s odpočtem. Desku odneste ven do stínu, mimo výfuky a dál od obličeje (vydechovaný vzduch má desítky tisíc ppm).
+3. Čidlo měří každých 5 s a displej ukazuje *Ustaluje se*, CO₂, teplotu a sklon. Nechte desku v klidu.
+4. Výsledek se ukáže dole na displeji místo nápovědy, např. *Kalibrace CO2 (SCD41) OK, korekce -65 ppm*. Znovu ho uvidíte v konfigurátoru i v hotspotu.
+
+Odklad se nastavuje vedle hodnoty reference, 0 až 600 s. Když už je deska na místě, nastavte 0.
+
+### Kdy se kalibruje
+
+FRC zapíše rozdíl mezi tím, co čidlo ukazuje *právě teď*, a referencí. Odezva SCD41 je podle datasheetu τ63 = 60 s, v krabičce několikanásobně delší. Kalibrace po pevné době by zapsala korekci, dokud čidlo po přenesení z místnosti ještě klesá. Firmware proto počítá lineární regresi přes posledních 3 minuty a FRC pošle, až současně platí:
+
+| Podmínka | Mez |
+|---|---|
+| sklon CO₂ | < 5 ppm/min |
+| sklon teploty čidla | < 0,2 °C/min |
+| rozptyl CO₂ kolem regresní přímky | < 20 ppm RMS |
+| podmínky platí nepřetržitě | ≥ 60 s |
+| doba měření | 3 až 20 min |
+
+Když se hodnoty do 20 minut neustálí (kolem desky chodí lidé, ohřívá ji slunce), kalibrace se neprovede a displej ukáže *neustalilo se*.
+
+Obvyklá doba je 5 až 15 minut. SCD41 se při měření každých 5 s sám ohřívá, takže i když je deska venku předem, čeká se na ustálení teploty čidla, typicky 6 minut.
+
+### Výsledek
+
+Korekci si ukládá **čidlo** (SCD41 do EEPROM, SEN6x do NVS). Přežije odpojení napájení i nahrání firmwaru.
+
+Korekce nad ±150 ppm se provede, ale výsledek se označí `(!)` a konfigurátor i hotspot připíšou vysvětlení. Tolerance SCD41 je ±(40 ppm + 5 %), takže tak velká korekce znamená jedno z dvou:
+
+- čidlo bylo dřív špatně zkalibrované a teď se to opravuje,
+- deska nebyla na čerstvém vzduchu. Pak kalibraci zopakujte, nová ji přepíše.
+
+Venkovní CO₂ kolísá, u domu nebo ráno při inverzi bývá 450 až 500 ppm. Rozdíl několika desítek ppm po kalibraci není důvod ji opakovat. Kalibrujte na volném prostranství a opakujte jednou za několik měsíců.
+
+Pod 3,45 V se SEN6x nespouští, kalibrace pak skončí *neprobehla - slaba baterie*.
+
+### Obnovení tovární kalibrace (jen SCD41)
+
+Tlačítko **Obnovit tovární kalibraci** v konfigurátoru i v hotspotu. Smaže všechny dosavadní korekce FRC i historii samokalibrace. Hodí se, když nevíte, co se s čidlem dělo: hned je vidět, co měří s výrobní kalibrací. Potom ho zkalibrujte venku.
+
+SEN6x tovární reset nemá, rozladěný SEN6x opravíte novou kalibrací.
 
 ---
 
@@ -124,21 +169,23 @@ Celé to trvá asi dvě minuty.
 
 **Přes WiFi (telefon):** při restartu podržte tlačítko **PUSH** déle než 5 s. Deska vytvoří zabezpečený hotspot `MeteoEink-XXXX` a na displeji ukáže SSID, heslo a QR kód pro připojení. Hotspot se po 5 minutách nečinnosti sám vypne, aby nevybíjel baterii.
 
-Nastavit lze interval měření, kalibrační offsety jednotlivých čidel, které čidlo dodává hlavní teplotu a vlhkost, a které veličiny se kreslí do grafů.
+Nastavit lze interval měření, kalibrační offsety jednotlivých čidel, které čidlo dodává hlavní teplotu a vlhkost, a které veličiny se kreslí do grafů. Každá vybraná veličina má volbu *Graf 1* až *Graf 4*: veličiny se stejným číslem se nakreslí do jednoho grafu (stejné jednotky až tři křivky, různé jednotky dvě a druhá osa Y). Přeskládání grafů historii nesmaže, přidání nebo odebrání veličiny ano.
 
 ### 3. Tlačítka (držet při restartu)
 
 | Tlačítko | Doba | Co udělá |
 |---|---|---|
-| PUSH (GPIO40) | 2-5 s | servisní režim přes USB (sériová linka, 115200 Bd) |
+| PUSH (GPIO40) | 2-5 s | nastavení přes USB (konfigurátor na webu) |
 | PUSH (GPIO40) | > 5 s | WiFi hotspot s konfigurační stránkou |
 | DOWN (GPIO41) | 5 s | smaže celou historii měření |
+
+První dva řádky připomíná i nápověda dole na displeji.
 
 ---
 
 ## Pro vývojáře
 
-Celý firmware je jeden soubor: [`MeteoEink426/MeteoEink426.ino`](MeteoEink426/MeteoEink426.ino) (~4300 řádků, Arduino framework). Součástí je i konfigurační stránka hotspotu jako raw string.
+Celý firmware je jeden soubor: [`MeteoEink426/MeteoEink426.ino`](MeteoEink426/MeteoEink426.ino) (~5700 řádků, Arduino framework). Součástí je i konfigurační stránka hotspotu jako raw string.
 
 ### Build
 
@@ -184,6 +231,7 @@ Soubor je rozdělený komentářovými hlavičkami na sekce, v tomto pořadí:
 Klíčové věci, které je dobré znát před úpravami:
 
 - **Arduino IDE vkládá vygenerované prototypy těsně před první definici funkce v souboru.** Když se typ použitý v hlavičce funkce (`Quantity`, `Reading`, `Detected`, `SenKind`, ...) definuje až za tou první funkcí, překlad spadne na desítkách hlášek `'Quantity' was not declared in this scope`. **V souboru nesmí být žádná definice funkce dřív než blok typů v sekci VELIČINY A ČIDLA.** Čistý `g++` tuhle chybu neodhalí.
+- **Kanál vs. panel.** Kanál je jedna veličina v historii, panel je jeden rám grafu. Do v4.3 to bylo 1:1, od v4.4 může panel nést až tři kanály. Rozdělení dělá `buildPlots()`, sloučit lze jen sousední kanály, takže panel je prostě rozsah v `channels[]`. Seskupení se veze v horním bitu `cfg.chSel[]` a **nevstupuje do `buildSignature()`**. Pořadí kanálů v podpisu je a sloučení ho často mění. Když jde jen o jiné pořadí stejných veličin, `histPermute()` přehodí bloky v poolu a historie se hned uloží do NVS pod novým podpisem. Výběr kanálů rozebírá pro servis i hotspot jedna funkce, `chParse()`.
 - **Historie** žije v `RTC_DATA_ATTR int16_t histPool[POOL_SLOTS]` jako společný kruhový pool. Kanál `c` zabírá rozsah `histPool[c*histPerCh ... c*histPerCh + histPerCh-1]`, `histPerCh` se dopočítává z počtu aktivních kanálů. RTC RAM přežije deep sleep; do NVS se zapisuje jen každé `NVS_SAVE_EVERY` měření, aby se šetřilo flash.
 - **Konfigurace** je struktura `Config` v NVS (namespace `meteo`, klíč `cfg`), chráněná hodnotou `CFG_MAGIC`. Když strukturu změníte, změňte i magic - stará konfigurace se pak ignoruje místo toho, aby se přečetla špatně. `cfgSanitize()` ošetřuje nesmyslné hodnoty, `cfgSave()` po zápisu ověřuje zpětným čtením.
 - **Zdroje veličin.** Teplotu a vlhkost hlásí až pět čidel. Offsety se přičítají na jednom místě v `mergeSources()`, ne v jednotlivých čtecích funkcích. Které čidlo je hlavní, odpovídá výhradně `tsrcPrimary()` / `hsrcPrimary()` - nikdy dostupnost čidel.
@@ -194,7 +242,9 @@ Klíčové věci, které je dobré znát před úpravami:
 Nejdůležitější konstanty na jednom místě v sekci `LIMITY A VÝCHOZÍ HODNOTY`:
 
 ```c
-#define MAX_CHANNELS      4      // max. počet grafů
+#define MAX_CHANNELS      4      // max. počet veličin v grafech
+#define MAX_PER_PLOT      3      // max. křivek v jednom grafu
+#define MAX_PER_PLOT_MIX  2      // totéž při různých jednotkách (dvě osy Y)
 #define POOL_SLOTS        2592   // 5184 B v RTC RAM
 #define HISTORY_CAP       2016   // strop vzorků na kanál
 #define DEF_INTERVAL      5      // výchozí interval [min]
@@ -213,41 +263,9 @@ Nejdůležitější konstanty na jednom místě v sekci `LIMITY A VÝCHOZÍ HODN
 4. Zohledněte veličinu v `qAvailable()` a v automatickém výběru kanálů.
 5. Dodává-li teplotu nebo vlhkost, přidejte ji do `TempSrc` / `HumSrc` - tím dostane vlastní offset i vlastní veličinu do grafu.
 
-### Servisní režim (USB, 115200 Bd)
+### Komunikace s konfigurátorem
 
-```
-KOMPENZACE  (každé čidlo má vlastní; bez tečky se nastaví to aktivní)
-toff.<čidlo>=<x>  offset teploty [°C]   (-20 až 20), čidlo: sht sen scd bme ds
-hoff.<čidlo>=<x>  offset vlhkosti [%RH] (-30 až 30), čidlo: sht sen scd bme
-poff=<x>          offset tlaku [hPa]    (-50 až 50)
-alt=<x>           nadmořská výška [m]   (0 až 4000)
-
-CO₂
-co2ref=<x>  kalibrace na známou hodnotu [ppm] (venku ~420, čidlo běží 3,5 min)
-asc=0|1     automatická samokalibrace (nechat na 0, viz výše)
-
-ČIDLO PRACHU SEN6x
-senwarm=<s> doba běhu před odečtem (5 až 120 s, výchozí 30)
-senmult=<n> násobek intervalu pro PM a CO₂ (1 až 4)
-senauto=<d> automatické čištění ventilátoru po d dnech (0 až 90, 0 = vypnuto)
-senclean    pročistit ventilátor hned při dalším měření
-senstat     stavové bity čidla
-lsleep=0|1  uspat ESP32 během zahřívání čidla (šetří ~30 %)
-
-MĚŘENÍ A GRAF
-int=<min>     základní interval (1 až 60) - mění délku historie
-tsrc=<čidlo>  které čidlo dodává hlavní teplotu (auto = podle priority)
-hsrc=<čidlo>  které čidlo dodává hlavní vlhkost
-ch=auto       automatický výběr kanálů grafu
-ch=a,b,c      ruční výběr až 4 veličin, např. ch=co2,pm25,temp.sht,temp.sen
-
-SPRÁVA
-list   nastavení    ver    verze firmwaru    dump   historie jako CSV
-save   uložit       clear  smazat historii   exit   uložit a ukončit
-help / ?  nápověda
-```
-
-Režim se ukončí po 60 s nečinnosti.
+Konfigurátor přes USB posílá desce textové příkazy po sériové lince (115200 Bd), stránka hotspotu volá `/api/set`. Obě cesty zpracovávají stejné funkce v sekcích `SERVISNÍ REŽIM` a `WIFI HOTSPOT`.
 
 ---
 

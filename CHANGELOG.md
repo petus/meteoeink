@@ -1,5 +1,117 @@
 # MeteoEink426 - changelog
 
+## v4.4.0
+
+Konfigurace i historie zůstávají (`CFG_MAGIC` je pořád `MEK7`).
+
+### Nové
+
+- **Nápověda k nastavení na displeji.** Nad zápatím je řádek
+  `Pri restartu drz PUSH: 2 s = servis (USB), 5 s = WiFi`. Zabírá 16 px,
+  při čtyřech grafech tedy 4 px z každého. Mazání historie tlačítkem DOWN se
+  záměrně neuvádí, protože je nevratné.
+- **Více veličin v jednom grafu.** V `ch=` slučuje veličiny znak `+`:
+
+  ```
+  ch=temp.sht+temp.sen,co2      dva grafy, v prvním dvě křivky
+  ch=co2+temp,pm25              první graf má dvě osy Y
+  ```
+
+  Stejné jednotky sdílejí jednu osu (nejvýš tři křivky), různé jednotky
+  dostanou druhou osu Y vpravo (nejvýš dvě křivky). Křivky se rozlišují stylem
+  čáry (plná, čárkovaná, tečkovaná) a popiskem na konci. Graf má víc místa:
+  čtyři veličiny ve dvou grafech mají 231 px na výšku místo 94 px.
+
+  Slučuje se jen na výslovné přání, automatický výběr kanálů to nedělá. Když
+  je společný rozsah osy víc než trojnásobkem rozsahu nejširší z křivek
+  (třeba pokojová a venkovní teplota v zimě), napíše se to do záhlaví grafu.
+
+  V konfigurátoru i na stránce hotspotu má každá vybraná veličina volbu
+  *Graf 1* až *Graf 4*, veličiny se stejným číslem jdou do jednoho grafu.
+  Stránka ukáže výsledné rozložení, nepustí víc křivek, než graf unese,
+  a upozorní na DS18B20 ve společné ose s pokojovou teplotou. Hotspot
+  rozebírá výběr stejnou funkcí `chParse()` jako servis a odmítnutý výběr
+  vrátí stránce s důvodem. JSON stavu má nové pole `plots` (počet křivek
+  v jednotlivých grafech).
+
+  Délka historie se nemění, řídí se počtem kanálů, ne grafů. Seskupení se
+  ukládá do horního bitu `cfg.chSel[]` a nevstupuje do podpisu sestavy.
+  Sloučit jde jen sousední kanály, takže sloučení často mění pořadí kanálů.
+  Když zůstanou stejné veličiny, jen v jiném pořadí, `histPermute()` přehodí
+  bloky v poolu a historie zůstane (dřív se smazala). Platí to pro servis
+  i hotspot, i když servis skončí timeoutem bez uložení. `list` vypisuje
+  `ch = ...` beze změny (čte ho konfigurátor) a sloučení na zvláštním řádku
+  `grafy = ...`.
+- **Obnovení tovární kalibrace SCD41.** Příkaz `co2reset`, tlačítko
+  v hotspotu a v konfigurátoru. Volá `perform_factory_reset`, který smaže
+  všechny korekce FRC i historii ASC. Pak se znovu nastaví `asc` podle
+  konfigurace. SEN6x tento příkaz nemá.
+
+### Kalibrace CO₂
+
+Kalibrace (FRC) dřív u SCD41 nefungovala vůbec a u obou čidel zapisovala
+špatnou korekci. Postup je přepracovaný a platí pro SCD41 i SEN6x.
+
+- **Opraveno: SCD41 kalibraci odmítal.** FRC se posílalo asi sekundu po
+  zapnutí čidla. Datasheet požaduje nejméně 3 minuty měření v ustáleném
+  prostředí. Čidlo vrátilo 0xFFFF a deska přešla rovnou do měření.
+- **FRC se pošle až po ustálení hodnot.** FRC zapíše jako korekci rozdíl mezi
+  aktuálním údajem čidla a referencí. Odezva SCD41 je τ63 = 60 s,
+  v krabičce několikanásobně delší. Kalibrace po pevné době proto zapsala
+  korekci, dokud čidlo ještě klesalo (v testu −90 ppm, venku pak 330 ppm).
+  Nový postup:
+  1. odklad startu, výchozí 90 s, nastavitelný 0 až 600 s
+     (`co2ref=420,180`), na displeji odpočet,
+  2. měření každých 5 s,
+  3. FRC se pošle, když v okně posledních 3 minut platí současně: sklon
+     CO₂ (lineární regrese) pod 5 ppm/min, sklon teploty pod 0,2 °C/min,
+     rozptyl CO₂ kolem regresní přímky pod 20 ppm RMS, a to nepřetržitě
+     aspoň 60 s,
+  4. nejdřív po 3 minutách měření, nejpozději po 20 minutách. Pak se
+     kalibrace neprovede a výsledek je *neustalilo se*.
+
+  Hlídání teploty je nutné kvůli SCD41: při měření každých 5 s se čidlo
+  samo ohřívá, v testu o 1,8 °C za 5 minut, a kompenzace CO₂ na teplotě
+  závisí. Kalibrace u SCD41 proto trvá i venku asi 6 minut.
+  V simulaci s modelem čidla (exponenciální odezva, šum, dech při nesení)
+  klesla chyba kalibrace ze 140 ppm na 4 ppm. Ověřeno na hardwaru se SEN63C
+  i SCD41; SCD41 po kalibraci na 420 ppm ukazoval venku 405 až 437 ppm.
+- **Velká korekce jen varuje.** Korekce nad ±150 ppm se provede, výsledek se
+  označí `(!)` a hotspot i `list` vypíšou vysvětlení. Blokování by znemožnilo
+  opravit předchozí špatnou kalibraci, kdy je velká korekce správně.
+- **Opraveno: požadavek na kalibraci se mohl ztratit.** Když SCD41
+  neodpověděl na `begin()`, SEN6x se nespustil, byla slabá baterie nebo SEN6x
+  při `senmult > 1` přeskakoval cyklus, funkce skončila před kalibrací
+  a deep sleep požadavek zahodil. Teď každá cesta zapíše výsledek
+  a kalibrace má přednost před `senmult`. `begin()` u SCD41 se při selhání
+  jednou zopakuje.
+- **Průběh a výsledek na displeji.** Po ukončení servisu nebo hotspotu se
+  ukáže obrazovka *Prave probiha kalibrace CO2* s typem čidla a referencí.
+  Stav, CO₂, teplota a sklon se obnovují částečným překreslením každých 30 s.
+  Výsledek se pak 12 překreslení ukazuje místo nápovědy. Ukládá se do NVS,
+  ukazuje ho hotspot (panel CO₂) a `list` (řádek `posledni:`).
+- **Opraveno: SCD41 nedostával tlak z barometru.** Barometr se četl až po
+  SCD41. Teď se čte před ním a SCD41 dostane `set_ambient_pressure` při
+  každém zapnutí (nastavení je volatilní).
+- **Opraveno: nadmořská výška nešla nastavit bez barometru.** Konfigurátor
+  i hotspot pole ukazovaly jen s BME/BMP280, přitom bez barometru je výška
+  jediný zdroj kompenzace tlaku. Sestavy jen se SCD41 měly vždy `alt = 0`,
+  ve 250 m n. m. to dělá chybu asi 3 %.
+
+### Další opravy
+
+- **První vzorek po servisu nebo hotspotu neukládá teplotu a vlhkost
+  z čidel na desce.** Deska byla minuty vzhůru, často na nabíjejícím USB,
+  a SHT40 bylo ohřáté o ~4 °C. V grafu je místo špičky mezera. Čidla na
+  kabelu se ukládají normálně.
+- **Osa vlhkosti jednotlivých čidel.** `hum.sht` až `hum.bme` dostávaly
+  rozsah osy jako teplota (minimální rozpětí 2 místo 5 %RH), takže šum
+  vypadal jako velký výkyv. Třídu osy teď určuje jedno místo, `qAxisClass()`.
+- **Varování o slabé baterii.** Mazací obdélník byl o 4 px nižší a nad
+  varováním zůstával okraj předchozího řádku.
+
+---
+
 ## v4.3.2
 
 Konfigurace i historie zůstávají.
