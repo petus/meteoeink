@@ -47,6 +47,7 @@
  *
  * Z dostupnych velicin se kresli az 4 grafy. Vyber je automaticky podle
  * priority, nebo rucne prikazem  ch=co2,pm25,temp  v servisnim rezimu.
+ * Plus slucuje veliciny do jednoho grafu:  ch=temp.sht+temp.sen,co2
  *
  * ADAPTIVNI HISTORIE: pamet je spolecny pool. Cim min kanalu, tim delsi
  * historie. Delka take zavisi na nastavenem intervalu mereni.
@@ -106,7 +107,7 @@
 // duvod viz varovani v sekci VELICINY A CIDLA.
 // ============================================================================
 #define FW_NAME     "MeteoEink426"
-#define FW_VERSION  "4.3.2"
+#define FW_VERSION  "4.4.0"
 
 // ============================================================================
 // SYMBOLY, KTERE FONTY ADAFRUIT GFX NEMAJI
@@ -155,6 +156,14 @@
 // LIMITY A VYCHOZI HODNOTY
 // ============================================================================
 #define MAX_CHANNELS      4        // displej i historie zvladnou 4 grafy
+// Slucovani kanalu do jednoho panelu. Strop je 3, navrzeno je to na 2:
+// pri trech krivkach uz se cárkovana a teckovana cara na rozkmitanem prubehu
+// pri 219 DPI rozlisi spatne a rozsahy serii se nevejdou do zahlavi na jeden
+// radek. Ctyri krivky patri na web, kde je barva i odecet dotykem.
+#define MAX_PER_PLOT      3        // max. krivek v jednom panelu (stejna jednotka)
+#define MAX_PER_PLOT_MIX  2        // max. krivek pri ruznych jednotkach (dve osy)
+#define CH_JOIN_BIT       0x80     // v cfg.chSel: slucit s predchozim kanalem
+#define CH_Q_MASK         0x7F     // v cfg.chSel: vlastni Quantity
 #define POOL_SLOTS        2592     // 5184 B v RTC RAM (~74 % bezpec. rozpoctu)
 #define HISTORY_CAP       2016     // strop vzorku na kanal (7 dni pri 5 min)
 
@@ -187,6 +196,53 @@
 #define SEN_CLEAN_HI      90       // automaticke cisteni nejvyse jednou za 90 dni
 #define DEF_SEN_CLEAN     7        // Sensirion doporucuje tydne az mesicne
 #define I2C_HZ_SEN6X      100000UL // datasheet SEN6x: max 100 kbit/s
+
+// --- Kalibrace CO2 (FRC) -------------------------------------------------------
+// Datasheet SCD4x i SEN6x shodne: pred FRC musi cidlo bezet "> 3 minutes in
+// an environment with homogenous and constant CO2 concentration", a to
+// v rezimu, ve kterem pak normalne meri. Pro SCD41 je to single shot.
+//
+// Tri minuty OD ZAPNUTI ale nestaci. Odezva SCD41 je podle datasheetu
+// tau63 = 60 s "typicky", v krabicce s malymi otvory klidne nekolikanasobne
+// vic. Po preneseni z mistnosti (~650 ppm) ven (420 ppm) pri tau ~3 min
+// zbyva po 3 minutach jeste ~37 % rozdilu, tedy ~85 ppm - a FRC ho natvrdo
+// zapise jako korekci. V praxi pak cidlo venku ukazovalo ~330 ppm.
+//
+// Kalibrace proto ceka, AZ SE HODNOTY USTALI:
+//   1. odklad (cas na odneseni desky), s odpoctem na displeji,
+//   2. mereni po CAL_SAMPLE_MS; z poslednich CAL_WIN_MS se linearni regresi
+//      spocita sklon CO2 a teploty,
+//   3. FRC az kdyz od konce odkladu ubehlo aspon CAL_MIN_MS, oba sklony i
+//      rozptyl jsou pod prahem a vydrzi to CAL_HOLD_MS; kdyz se to do
+//      CAL_MAX_MS nestane, kalibrace se NEPROVEDE,
+//   4. kalibrace s korekci nad CAL_MAX_CORR se PROVEDE, ale vysledek se
+//      oznaci jako neobvykly (CAL_OK_BIG). Drive se takova kalibrace
+//      blokovala, jenze pak nesla opravit predchozi spatna kalibrace - presne
+//      v te situaci je velka korekce potreba. Omyl (deska zustala v mistnosti)
+//      je vratny: staci kalibraci zopakovat, nebo obnovit tovarni (co2reset).
+#define CAL_DELAY_DEF     90       // vychozi odklad startu [s]
+#define CAL_DELAY_MAX     600      // nejdelsi povoleny odklad [s]
+#define CAL_SAMPLE_MS     5000UL   // rozestup vzorku (SCD41 single shot ~5 s)
+#define CAL_WIN_MS        180000UL // okno pro vypocet sklonu (3 min = 36 vzorku)
+#define CAL_WIN_MIN_N     30       // aspon tolik platnych vzorku v okne
+#define CAL_MIN_MS        180000UL // mereni po odkladu nejmene 3 min (datasheet)
+#define CAL_MAX_MS        1200000UL // ... a nejvys 20 min, pak to vzdat. S tau
+                                   // ~5 min (pomala krabicka) trva ustaleni ~15 min.
+#define CAL_SLOPE_CO2     5.0f     // prah sklonu CO2 [ppm/min]; sum ±10 ppm na
+                                   // vzorek dava chybu odhadu ~2 ppm/min
+#define CAL_SLOPE_T       0.2f     // prah sklonu teploty [degC/min]
+#define CAL_RESID_MAX     20.0f    // rozptyl CO2 kolem regresni primky [ppm RMS].
+                                   // SCD41 v single shotu mel v ustalene fazi
+                                   // 12-14 ppm, 15 bylo na hrane.
+                                   // Bez nej by kolisajici prostredi proslo: sklon
+                                   // pres 3 min sinusovky je u vrcholu skoro nula.
+#define CAL_HOLD_MS       60000UL  // podminky ustaleni musi platit nepretrzite
+#define CAL_MAX_CORR      150      // vetsi korekce = vysledek se oznaci jako neobvykly
+                                   // [ppm]; vyrobni tolerance SCD41 je ±(50 ppm + 5 %)
+#define CAL_MEAN_MS       60000UL  // prumer pro odhad korekce (posledni minuta)
+#define CAL_DRAW_MS       30000UL  // jak casto prekreslit prubeh na displeji
+#define CAL_FAIL_MAX      12       // tolik selhanych vzorku po sobe = cidlo nemeri
+#define CAL_SHOW_RENDERS  12       // kolikrat ukazat vysledek na displeji
 
 // ============================================================================
 // DISPLEJ
@@ -226,6 +282,18 @@ enum Quantity : uint8_t {
   Q_H_SHT, Q_H_SEN, Q_H_SCD, Q_H_BME
 };
 #define Q_LAST Q_H_BME              // pojistka pri validaci konfigurace
+
+// Trida osy. Veliciny stejne tridy se meri v tomtez a ma smysl je kreslit
+// do jedne spolecne osy; ruzne tridy potrebuji v jednom panelu osy dve.
+// Zaroven urcuje, jak se rozsah osy zaokrouhluje a jake ma minimum - drive
+// to byl switch primo v drawOneGraph(), kde vlhkosti jednotlivych cidel
+// (Q_H_SHT az Q_H_BME) omylem padaly do vetve pro teploty.
+//
+// POZOR: enum musi byt tady v bloku typu, ne nize u funkci. Pouziva ho
+// hlavicka qAxisClass() a Arduino IDE vklada prototypy pred prvni funkci.
+enum AxisClass : uint8_t {
+  AX_TEMP = 0, AX_HUM, AX_CO2, AX_PRESS, AX_VBAT, AX_PM, AX_NONE
+};
 
 enum BoschType : uint8_t { BOSCH_NONE = 0, BOSCH_BME280, BOSCH_BMP280 };
 
@@ -269,9 +337,31 @@ Detected det;
 uint8_t  shtAddr = 0;               // 0x44 / 0x45 / 0x46, 0 = nenalezeno
 uint8_t  sht4xDetect();             // definovano nize v sekci MERENI
 
-struct Channel { Quantity q; bool dashed; };
+// Kanal = jedna velicina v historii. Panel (Plot) = jeden ram grafu, ktery
+// kresli jednu az tri krivky. Do v4.3 to bylo 1:1, od v4.4 si uzivatel muze
+// kanaly slucovat prikazem  ch=temp.sht+temp.sen,co2
+//
+// style rozlisuje krivky v jednom panelu: e-ink nema barvu ani hover, takze
+// jedine, co zbyva, je styl cary + popisek na jejim konci.
+#define CH_SOLID   0
+#define CH_DASHED  1
+#define CH_DOTTED  2
+
+struct Channel {
+  Quantity q;
+  uint8_t  style;      // CH_SOLID / CH_DASHED / CH_DOTTED - poradi v panelu
+  bool     join;       // kresli se do stejneho panelu jako predchozi kanal
+};
 Channel  channels[MAX_CHANNELS];
 uint8_t  channelCount = 0;
+
+// Panel odkazuje do channels[] rozsahem, protoze slucovat lze jen sousedni
+// kanaly - tim odpada mapovaci pole i moznost, aby si panel "ukradl" kanal
+// z prostredka.
+struct Plot { uint8_t first; uint8_t n; };
+Plot     plots[MAX_CHANNELS];
+uint8_t  plotCount = 0;
+
 uint16_t histPerCh = 0;            // vzorku na kanal (dopocitano)
 
 Adafruit_BME280   bme;
@@ -346,7 +436,12 @@ struct Config {
   uint8_t  scdAsc;
   uint8_t  intervalMin;
   uint8_t  chAuto;                 // 1 = automaticky vyber kanalu
-  uint8_t  chSel[MAX_CHANNELS];    // rucni vyber (Quantity)
+  // Rucni vyber. Dolnich 7 bitu je Quantity, nejvyssi bit (CH_JOIN_BIT) rika
+  // "kresli se do stejneho panelu jako predchozi kanal". Je to schovane sem
+  // zamerne: Q_LAST je 16, takze se do bajtu vejde obojí a struktura Config
+  // nemusi rust - jinak by se musel zmenit CFG_MAGIC a vsem by se resetovalo
+  // nastaveni kvuli ciste kosmeticke funkci.
+  uint8_t  chSel[MAX_CHANNELS];
   char     apPass[13];             // heslo WiFi hotspotu (8-12 znaku)
   uint8_t  senWarmS;               // doba behu SEN6x pred odectem [s]
   uint8_t  senMult;                // nasobek intervalu pro PM a CO2 (1x az 4x)
@@ -359,6 +454,57 @@ struct Config {
 };
 Config  cfg;
 int16_t pendingCo2Ref = -1;        // jednorazovy pozadavek, neuklada se
+
+// Vysledek posledni kalibrace CO2.
+//
+// Kalibrace probiha az PO zavreni servisu nebo hotspotu, takze ji clovek
+// u sériove linky ani na webu nevidi dobehnout. Vysledek se proto:
+//   - na nekolik prekresleni ukaze na displeji misto radku s napovedou
+//     (RTC RAM, prezije deep sleep),
+//   - ulozi do NVS, at ho ukaze i pristi otevreni hotspotu a prikaz 'list'.
+// Do NVS se zapisuje jen pri kalibraci, takze flash to neopotrebuje.
+#define CAL_MAGIC     0xCA
+#define CAL_OK        0            // FRC probehla, cidlo vratilo korekci
+#define CAL_E_FRC     1            // cidlo FRC odmitlo (vratilo 0xFFFF)
+#define CAL_E_NORESP  2            // cidlo neodpovida na I2C
+#define CAL_E_LOWBAT  3            // SEN6x pri slabe baterii nespoustime
+#define CAL_E_START   4            // SEN6x se nepodarilo spustit
+#define CAL_E_SHOTS   5            // cidlo behem kalibrace skoro nemerilo
+#define CAL_E_UNSTABLE 6           // hodnoty se do CAL_MAX_MS neustalily
+#define CAL_E_BIGCORR 7            // drive: velka korekce zablokovana (stare zaznamy v NVS)
+#define CAL_OK_BIG    8            // FRC probehla, korekce ale nad CAL_MAX_CORR
+#define CAL_RESET     9            // obnovena tovarni kalibrace (co2reset)
+
+struct CalResult {
+  uint8_t magic;                   // CAL_MAGIC, jinak zaznam neplati
+  uint8_t status;                  // CAL_OK / CAL_E_...
+  int16_t target;                  // reference [ppm]
+  int16_t corr;                    // korekce [ppm], plati jen pri CAL_OK
+  char    sensor[8];               // "SCD41", "SEN63C", ...
+};
+RTC_DATA_ATTR CalResult calLast     = { 0, 0, 0, 0, "" };
+
+// Parametry naplanovane kalibrace (jen pro jeden beh, neukladaji se).
+uint16_t pendingCalDelayS = CAL_DELAY_DEF;  // odklad startu [s]
+
+// Vzorek pro kalibraci: jedno mereni CO2 a teploty. Kazde cidlo ma svou
+// funkci; spolecna smycka calRun() z nich pozna, kdy je prostredi ustalene.
+// Typ musi byt tady nahore - pouziva ho hlavicka calRun().
+typedef bool (*CalSampleFn)(float &co2, float &tc);
+
+// Co ukazuje obrazovka probihajici kalibrace. Taky v hlavicce funkci.
+#define CALV_DELAY    0            // odpocet - cas odnest desku
+#define CALV_SETTLE   1            // meri se, hodnoty se jeste meni
+#define CALV_STABLE   2            // ustaleno, za chvili FRC
+struct CalView {
+  const char *sensor;
+  int16_t  target;
+  uint8_t  phase;                  // CALV_...
+  float    co2, tc;                // posledni vzorek (NAN = zatim zadny)
+  float    slope;                  // sklon CO2 [ppm/min] (NAN = malo dat)
+  uint32_t secs;                   // odpocet (DELAY) nebo cas mereni [s]
+};
+RTC_DATA_ATTR uint8_t   calShowLeft = 0;   // kolik prekresleni jeste ukazat
 bool    pendingFanClean = false;   // jednorazove cisteni ventilatoru SEN6x
 
 // ----------------------------------------------------------------------------
@@ -433,8 +579,11 @@ void cfgSanitize() {
   if (cfg.senCleanDays > SEN_CLEAN_HI) cfg.senCleanDays = DEF_SEN_CLEAN;
   if (cfg.tSrcPref > TSRC_COUNT) cfg.tSrcPref = TSRC_COUNT;
   if (cfg.hSrcPref > HSRC_COUNT) cfg.hSrcPref = HSRC_COUNT;
+  // Priznak slucovani se validuje zvlast - Q_LAST se tyka jen dolnich 7 bitu.
   for (uint8_t i = 0; i < MAX_CHANNELS; i++)
-    if (cfg.chSel[i] > Q_LAST) cfg.chSel[i] = Q_NONE;
+    if ((cfg.chSel[i] & CH_Q_MASK) > Q_LAST) cfg.chSel[i] = Q_NONE;
+  // Prvni kanal nema s cim slucovat.
+  cfg.chSel[0] &= CH_Q_MASK;
   cfg.apPass[12] = 0;                               // vzdy ukoncene
   size_t pl = strlen(cfg.apPass);
   if (pl > 0 && pl < 8) cfg.apPass[0] = 0;          // kratsi nez WPA2 minimum
@@ -446,6 +595,7 @@ void cfgSanitize() {
 #define NVS_SIGPEND "sigp"         // kandidat na novou sestavu
 #define NVS_SIGCNT  "sigc"         // kolikrat uz se potvrdil
 #define NVS_CLEAN   "clmin"        // minut od posledniho cisteni ventilatoru
+#define NVS_CAL     "cal"          // vysledek posledni kalibrace CO2
 
 void cfgLoad() {
   cfgDefaults();
@@ -499,6 +649,9 @@ RTC_DATA_ATTR uint16_t histSlots = 0;      // histPerCh platne pro data v poolu
 RTC_DATA_ATTR uint32_t rtcSignature = 0;
 RTC_DATA_ATTR uint16_t saveTick = 0;
 RTC_DATA_ATTR bool     rtcInited = false;
+// Servis nebo hotspot jen prehodil poradi kanalu (relayoutHistory). Podpis
+// sestavy poradi obsahuje, proto se historie hned ulozi pod novym podpisem.
+bool histRemapped = false;
 
 // Pocitadla pro SEN6x. Jsou v RTC RAM, takze prezijou deep sleep;
 // senCleanMin se navic odklada do NVS (prezije i vymenu baterie).
@@ -1343,10 +1496,68 @@ bool qOffered(Quantity q) {
   return true;
 }
 
+// Do ktere osove tridy velicina patri. Jedine misto, kde se rozhoduje, co
+// se da kreslit do spolecne osy.
+AxisClass qAxisClass(Quantity q) {
+  switch (q) {
+    case Q_TEMP: case Q_TEMP2:
+    case Q_T_SHT: case Q_T_SEN: case Q_T_SCD: case Q_T_BME: return AX_TEMP;
+    case Q_HUM:
+    case Q_H_SHT: case Q_H_SEN: case Q_H_SCD: case Q_H_BME: return AX_HUM;
+    case Q_CO2:   return AX_CO2;
+    case Q_PRESS: return AX_PRESS;
+    case Q_VBAT:  return AX_VBAT;
+    case Q_PM25:  case Q_PM10: return AX_PM;
+    default:      return AX_NONE;
+  }
+}
+
+// Rozdeli kanaly na panely podle priznaku join a prideli krivkam styly.
+// Slucovat lze jen SOUSEDNI kanaly, takze panel je proste rozsah v channels[].
+void buildPlots() {
+  plotCount = 0;
+  for (uint8_t c = 0; c < channelCount; c++) {
+    bool startNew = (plotCount == 0) || !channels[c].join;
+
+    if (!startNew) {
+      Plot &p = plots[plotCount - 1];
+      // Pojistka proti konfiguraci, ktera by prosla ze starsi verze nebo
+      // z rucniho zasahu: ruzne osove tridy uneseme nejvyse dve (dve osy),
+      // stejnou tridu nejvyse tri.
+      bool mixed = false;
+      for (uint8_t i = 0; i < p.n; i++)
+        if (qAxisClass(channels[p.first + i].q) != qAxisClass(channels[c].q)) mixed = true;
+      if (p.n >= (mixed ? MAX_PER_PLOT_MIX : MAX_PER_PLOT)) startNew = true;
+    }
+
+    if (startNew) {
+      plots[plotCount].first = c;
+      plots[plotCount].n     = 1;
+      channels[c].style      = CH_SOLID;
+      channels[c].join       = false;    // srovnat se skutecnosti
+      plotCount++;
+    } else {
+      Plot &p = plots[plotCount - 1];
+      channels[c].style = (p.n == 1) ? CH_DASHED : CH_DOTTED;
+      p.n++;
+    }
+  }
+}
+
+// Ma panel dve ruzne osove tridy, tedy dve osy Y?
+bool plotDualAxis(uint8_t pi) {
+  if (pi >= plotCount || plots[pi].n < 2) return false;
+  const Plot &p = plots[pi];
+  AxisClass a = qAxisClass(channels[p.first].q);
+  for (uint8_t i = 1; i < p.n; i++)
+    if (qAxisClass(channels[p.first + i].q) != a) return true;
+  return false;
+}
+
 // Sestavi kanaly: bud rucni vyber, nebo automaticka priorita.
 void buildChannels() {
   channelCount = 0;
-  auto add = [&](Quantity q) {
+  auto add = [&](Quantity q, bool join) {
     if (channelCount >= MAX_CHANNELS || q == Q_NONE || !qAvailable(q)) return;
     // Bez duplicit - a to i skrytych. "temp" pri tsrc=sen je tataz vec jako
     // "temp.sen", takze by se jinak kreslily dve totozne krivky a zabraly
@@ -1354,13 +1565,15 @@ void buildChannels() {
     Quantity canon = qCanonical(q);
     for (uint8_t i = 0; i < channelCount; i++)
       if (qCanonical(channels[i].q) == canon) return;
-    channels[channelCount].q = q;
-    channels[channelCount].dashed = false;   // kazdy kanal ma vlastni graf
+    channels[channelCount].q     = q;
+    channels[channelCount].style = CH_SOLID;      // dopocita buildPlots()
+    channels[channelCount].join  = join && (channelCount > 0);
     channelCount++;
   };
 
   if (!cfg.chAuto) {
-    for (uint8_t i = 0; i < MAX_CHANNELS; i++) add((Quantity)cfg.chSel[i]);
+    for (uint8_t i = 0; i < MAX_CHANNELS; i++)
+      add((Quantity)(cfg.chSel[i] & CH_Q_MASK), (cfg.chSel[i] & CH_JOIN_BIT) != 0);
   }
   if (channelCount == 0) {
     // Automaticka priorita: CO2 > PM2.5 > teplota > tlak > 2. teplota > vlhkost.
@@ -1368,10 +1581,19 @@ void buildChannels() {
     // a na rozdil od PM10 na nej existuji bezne limity (WHO 15 ug/m3 / 24 h).
     // Externi teplomer je vzdy vedoma volba uzivatele, vlhkost je z cidla
     // na desce k dispozici sama - proto ma temp2 prednost pred hum.
-    add(Q_CO2); add(Q_PM25); add(Q_TEMP); add(Q_PRESS); add(Q_TEMP2); add(Q_HUM);
+    //
+    // Automatika NIKDY neslucuje. Slucovani je vzdy vedome rozhodnuti
+    // uzivatele: dve pokojova cidla ve spolecnem grafu davaji smysl, pokojova
+    // a venkovni teplota v zime taky ne - osa by se roztahla na 38 °C a
+    // z denniho prubehu by nebylo videt nic.
+    add(Q_CO2, false); add(Q_PM25, false); add(Q_TEMP, false);
+    add(Q_PRESS, false); add(Q_TEMP2, false); add(Q_HUM, false);
   }
 
-  // Adaptivni delka historie podle poctu kanalu.
+  buildPlots();
+
+  // Adaptivni delka historie podle poctu KANALU. Slucovani na ni nema vliv -
+  // slouceny panel porad cte dva samostatne kanaly z poolu.
   uint16_t per = (channelCount > 0) ? (POOL_SLOTS / channelCount) : POOL_SLOTS;
   if (per > HISTORY_CAP) per = HISTORY_CAP;
   histPerCh = per;
@@ -1380,6 +1602,32 @@ void buildChannels() {
 // Prepocita kanaly a pokud se zmenilo rozlozeni historie nebo casovy krok,
 // zalozi historii znovu. Bez toho by data v poolu zustala v puvodnim
 // rozlozeni a export CSV i graf by cetly nesmysly.
+// Pool je ulozeny v poradi kanalu had[]. Kdyz channels[] obsahuje tytez
+// veliciny jen v jinem poradi, prehodi bloky v poolu a vrati true. Jinak
+// pool nemeni a vrati false. Bere se po jednom vzorku (4 x int16 na zasobniku),
+// takze nepotrebuje druhou kopii poolu.
+bool histPermute(const Quantity had[], uint8_t hadCount) {
+  if (hadCount != channelCount || histPerCh == 0) return false;
+  uint8_t from[MAX_CHANNELS];
+  bool    used[MAX_CHANNELS] = { false };
+  bool    same = true;
+  for (uint8_t c = 0; c < channelCount; c++) {
+    bool found = false;
+    for (uint8_t o = 0; o < hadCount; o++)
+      if (!used[o] && had[o] == channels[c].q) { from[c] = o; used[o] = true; found = true; break; }
+    if (!found) return false;
+    if (from[c] != c) same = false;
+  }
+  if (same) return true;
+  int16_t tmp[MAX_CHANNELS];
+  for (uint16_t i = 0; i < histPerCh; i++) {
+    for (uint8_t o = 0; o < hadCount; o++) tmp[o] = histPool[(uint32_t)o * histPerCh + i];
+    for (uint8_t c = 0; c < channelCount; c++) histPool[(uint32_t)c * histPerCh + i] = tmp[from[c]];
+  }
+  histRemapped = true;
+  return true;
+}
+
 void relayoutHistory(bool intervalChanged) {
   // Nestaci hlidat ROZLOZENI poolu - musi se hlidat i VYZNAM kanalu.
   // Zamena ch=co2,temp za ch=press,hum ma stejny pocet kanalu, ale ulozene
@@ -1399,9 +1647,20 @@ void relayoutHistory(bool intervalChanged) {
     for (uint8_t i = 0; i < channelCount; i++)
       if (had[i] != channels[i].q) { sameSet = false; break; }
 
-  if (histPerCh != before || histPerCh != histSlots || intervalChanged || !sameSet) {
+  // Stejne veliciny jen v jinem poradi: to je preskladani grafu (slucovat
+  // jde jen sousedni kanaly, takze slouceni casto poradi meni). Data se
+  // nemazou, bloky kanalu v poolu se prehodi. Pocet kanalu je stejny, takze
+  // histPerCh i rozestup vzorku zustavaji.
+  bool layoutSame = (histPerCh == before && histPerCh == histSlots && !intervalChanged);
+  if (!sameSet && layoutSame && histPermute(had, hadCount)) {
+    sameSet = true;
+    Serial.println("Zmenilo se jen poradi kanalu - historie zustava.");
+  }
+
+  if (!layoutSame || !sameSet) {
     histClear();
     histEraseNVS();
+    histRemapped = false;
     Serial.println("Zmenilo se rozlozeni nebo obsah kanalu - zalozena nova historie.");
   }
 }
@@ -1653,26 +1912,360 @@ void readSHT40(Reading &r) {
   r.hSht = h;
 }
 
+// ---------------------------------------------------------------------------
+// KALIBRACE CO2 (FRC) - spolecne pro SCD41 i SEN6x
+// ---------------------------------------------------------------------------
+// Ktere cidlo se bude kalibrovat. SCD41 ma prednost stejne jako pri mereni:
+// kdyz je v sestave, CO2 se bere z nej a CO2 ze SEN6x se nepouziva.
+// nullptr = v sestave neni nic, co by CO2 meril.
+const char* calSensorName() {
+  if (det.scd41) return "SCD41";
+  if (det.sen6x && senHasCo2()) return senKindName(senKind);
+  return nullptr;
+}
+
+// Text vysledku posledni kalibrace. Jen ASCII - kresli se i na displej, jehoz
+// fonty nic jineho neumeji. Delku hlida test layoutu: musi se vejit do radku
+// napovedy nad zapatim.
+void calText(char *o, size_t n) {
+  if (calLast.magic != CAL_MAGIC) { snprintf(o, n, "Kalibrace CO2 zatim neprobehla"); return; }
+  const char *s = calLast.sensor;
+  switch (calLast.status) {
+    case CAL_OK:       snprintf(o, n, "Kalibrace CO2 (%s) OK, korekce %+d ppm", s, (int)calLast.corr); break;
+    // Vykricnik = neobvykle velka korekce. Vysvetleni da calWarnText()
+    // tam, kde je misto (hotspot, list, seriova linka).
+    case CAL_OK_BIG:   snprintf(o, n, "Kalibrace CO2 (%s) OK, korekce %+d ppm (!)", s, (int)calLast.corr); break;
+    case CAL_RESET:    snprintf(o, n, "Kalibrace CO2 (%s) obnovena na tovarni", s); break;
+    case CAL_E_FRC:    snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo ji odmitlo", s); break;
+    case CAL_E_NORESP: snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo neodpovida", s); break;
+    case CAL_E_LOWBAT: snprintf(o, n, "Kalibrace CO2 (%s) neprobehla - slaba baterie", s); break;
+    case CAL_E_START:  snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo nenabehlo", s); break;
+    case CAL_E_SHOTS:  snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo nemerilo", s); break;
+    case CAL_E_UNSTABLE: snprintf(o, n, "Kalibrace CO2 (%s) neprobehla - neustalilo se", s); break;
+    // Korekce se uklada i tady (odhad z mereni), at je videt, o kolik slo.
+    case CAL_E_BIGCORR: snprintf(o, n, "Kalibrace CO2 (%s) zrusena - korekce %+d ppm", s, (int)calLast.corr); break;
+    default:           snprintf(o, n, "Kalibrace CO2 (%s) - neznamy vysledek", s); break;
+  }
+}
+
+// Vysvetleni k neobvyklemu vysledku, kdyz nejake je (jinak prazdny retezec).
+const char* calWarnText() {
+  if (calLast.magic != CAL_MAGIC) return "";
+  if (calLast.status == CAL_OK_BIG)
+    return "Neobvykle velka korekce. Pokud deska nebyla na cerstvem vzduchu,"
+           " kalibraci zopakujte. Opravuje-li predchozi spatnou kalibraci, je to v poradku.";
+  return "";
+}
+
+// Zapise vysledek (kalibrace i tovarniho resetu): RTC RAM kvuli displeji,
+// NVS kvuli hotspotu a 'list' pri dalsim startu.
+void calRecord(const char *sensor, uint8_t status, int16_t target, int32_t corr, float vbat) {
+  calLast.magic  = CAL_MAGIC;
+  calLast.status = status;
+  calLast.target = target;
+  if (corr >  32000) corr =  32000;
+  if (corr < -32000) corr = -32000;
+  calLast.corr   = (int16_t)corr;
+  strncpy(calLast.sensor, sensor ? sensor : "?", sizeof(calLast.sensor) - 1);
+  calLast.sensor[sizeof(calLast.sensor) - 1] = 0;
+  calShowLeft    = CAL_SHOW_RENDERS;
+
+  char buf[72];
+  calText(buf, sizeof(buf));
+  Serial.println(buf);
+  if (calWarnText()[0]) Serial.println(calWarnText());
+
+  // Pri podpeti se do flash nezapisuje (stejne pravidlo jako u historie).
+  // Na displeji se vysledek ukaze i tak - je v RTC RAM.
+  if (isnan(vbat) || vbat >= VBAT_NO_WRITE) {
+    if (prefs.begin(NVS_NS, false)) {
+      prefs.putBytes(NVS_CAL, &calLast, sizeof(calLast));
+      prefs.end();
+    }
+  }
+}
+
+// Ukonci pozadavek na kalibraci - JAKKOLI, uspechem i chybou. Kazda cesta,
+// ktera pendingCo2Ref spotrebuje, musi skoncit tady. Drive se pozadavek na
+// peti mistech tise zahazoval (selhany begin() u SCD41, preskoceny cyklus,
+// slaba baterie a nespusteny SEN6x) a uzivatel se nedozvedel nic.
+void calFinish(const char *sensor, uint8_t status, int32_t corr, float vbat) {
+  // Velka korekce kalibraci neblokuje, jen se oznaci (viz CAL_MAX_CORR).
+  if (status == CAL_OK && abs(corr) > CAL_MAX_CORR) status = CAL_OK_BIG;
+  calRecord(sensor, status, pendingCo2Ref, corr, vbat);
+  pendingCo2Ref = -1;
+}
+
+// Nacte posledni vysledek z NVS. Vola se po tvrdem startu, kdy RTC RAM
+// nemusi platit - hotspot i 'list' ho pak maji z ceho ukazat.
+void calLoadNVS() {
+  if (!prefs.begin(NVS_NS, true)) return;
+  CalResult c;
+  bool ok = prefs.isKey(NVS_CAL) &&
+            prefs.getBytes(NVS_CAL, &c, sizeof(c)) == sizeof(c) &&
+            c.magic == CAL_MAGIC;
+  prefs.end();
+  if (ok) { c.sensor[sizeof(c.sensor) - 1] = 0; calLast = c; }
+}
+
+// ---------------------------------------------------------------------------
+// SPOLECNA SMYCKA KALIBRACE - ceka, az se prostredi ustali (viz CAL_* nahore)
+// ---------------------------------------------------------------------------
+void calProgress(const CalView &v);   // kresli sekce KRESLENI
+
+#define CAL_BUF_N 48                  // kruhovy buffer vzorku, > CAL_WIN_MS / CAL_SAMPLE_MS
+
+// Cislo do vypisu, nebo "--", kdyz ho jeste neni z ceho spocitat. Drive se
+// v prvnim radku prubehu psalo "sklon 0.0 ppm/min", coz vypadalo jako
+// skutecne namerena nula.
+static const char* calFmt(char *b, size_t n, float v, const char *fmt) {
+  if (isnan(v)) snprintf(b, n, "--"); else snprintf(b, n, fmt, v);
+  return b;
+}
+
+// Sklony CO2 a teploty linearni regresi pres vzorky od tMin, a prumer CO2
+// za poslednich CAL_MEAN_MS. Regrese misto rozdilu prvniho a posledniho
+// vzorku: sum jednoho mereni (±10 ppm) by jinak rozhodoval sam.
+static void calStats(const uint32_t *bt, const float *bc, const float *bT,
+                     uint8_t n, uint32_t now, uint32_t tMin,
+                     float &sC, float &sT, float &rms, uint8_t &wn, float &mean) {
+  sC = NAN; sT = NAN; rms = NAN; wn = 0; mean = NAN;
+  double st = 0, sc = 0, stt = 0, tn = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    if ((int32_t)(bt[i] - tMin) < 0) continue;
+    st += (double)(bt[i] - tMin); sc += bc[i]; wn++;
+    if (!isnan(bT[i])) { stt += bT[i]; tn++; }
+  }
+  if (wn >= 2) {
+    const double mt = st / wn, mc = sc / wn, mT = tn ? stt / tn : 0;
+    double sxx = 0, sxy = 0, sxxT = 0, sxyT = 0;
+    for (uint8_t i = 0; i < n; i++) {
+      if ((int32_t)(bt[i] - tMin) < 0) continue;
+      const double dx = (double)(bt[i] - tMin) - mt;
+      sxx += dx * dx; sxy += dx * (bc[i] - mc);
+      if (!isnan(bT[i])) { sxxT += dx * dx; sxyT += dx * (bT[i] - mT); }
+    }
+    if (sxx > 0)       sC = (float)(sxy / sxx * 60000.0);      // za minutu
+    if (sxxT > 0 && tn >= 2) sT = (float)(sxyT / sxxT * 60000.0);
+    // Rozptyl kolem primky: u ustaleneho prostredi jen sum cidla.
+    if (sxx > 0) {
+      const double k = sxy / sxx;
+      double se = 0;
+      for (uint8_t i = 0; i < n; i++) {
+        if ((int32_t)(bt[i] - tMin) < 0) continue;
+        const double e = (bc[i] - mc) - k * ((double)(bt[i] - tMin) - mt);
+        se += e * e;
+      }
+      rms = (float)sqrt(se / wn);
+    }
+  }
+  double ms = 0; uint8_t mn = 0;
+  for (uint8_t i = 0; i < n; i++)
+    if ((int32_t)(bt[i] - (now - CAL_MEAN_MS)) >= 0 && (int32_t)(bt[i] - tMin) >= 0) { ms += bc[i]; mn++; }
+  if (mn) mean = (float)(ms / mn);
+}
+
+// Vraci CAL_OK, kdyz je prostredi ustalene a ocekavana korekce rozumna -
+// volajici pak posle FRC. Jinak duvod (CAL_E_...), proc ne. corrExp je
+// odhad korekce (reference - prumer za posledni minutu), plni se vzdy,
+// kdyz je z ceho.
+uint8_t calRun(const char *sensor, CalSampleFn sample, int32_t &corrExp) {
+  static uint32_t bt[CAL_BUF_N];
+  static float    bc[CAL_BUF_N], bT[CAL_BUF_N];
+  uint8_t n = 0, head = 0;
+  const int16_t  target  = pendingCo2Ref;
+  const uint32_t delayMs = (uint32_t)pendingCalDelayS * 1000UL;
+  const uint32_t t0 = millis();
+  uint32_t nextSample = t0, lastDraw = t0;
+  uint32_t okSince = 0;               // od kdy plati podminky ustaleni (0 = neplati)
+  uint16_t fails = 0;
+  CalView v = { sensor, target, CALV_DELAY, NAN, NAN, NAN, pendingCalDelayS };
+  corrExp = 0;
+
+  Serial.printf("Kalibrace CO2 (%s) na %d ppm: odklad %u s, pak az %lu min mereni,"
+                " dokud se hodnoty neustali.\n", sensor, (int)target,
+                (unsigned)pendingCalDelayS, (unsigned long)(CAL_MAX_MS / 60000UL));
+
+  uint8_t status;
+  while (true) {
+    // --- vzorek ---
+    if ((int32_t)(millis() - nextSample) >= 0) {
+      nextSample = millis() + CAL_SAMPLE_MS;
+      float c = NAN, t = NAN;
+      if (sample(c, t) && !isnan(c) && c > 0) {
+        bt[head] = millis(); bc[head] = c; bT[head] = t;
+        head = (uint8_t)((head + 1) % CAL_BUF_N);
+        if (n < CAL_BUF_N) n++;
+        fails = 0;
+        v.co2 = c; v.tc = t;
+      } else if (++fails >= CAL_FAIL_MAX) {
+        Serial.printf("Kalibrace: %u mereni po sobe selhalo.\n", (unsigned)fails);
+        status = CAL_E_SHOTS;
+        break;
+      }
+    }
+
+    // --- vyhodnoceni ---
+    const uint32_t now = millis(), el = now - t0;
+    const bool afterDelay = el >= delayMs;
+    // Okno nesmi siahat pred konec odkladu: co se merilo cestou ven, neplati.
+    uint32_t tMin = now - CAL_WIN_MS;
+    if ((int32_t)(tMin - (t0 + delayMs)) < 0) tMin = t0 + delayMs;
+    float sC, sT, rms, mean; uint8_t wn;
+    calStats(bt, bc, bT, n, now, tMin, sC, sT, rms, wn, mean);
+    if (!isnan(mean)) corrExp = (int32_t)lroundf((float)target - mean);
+
+    const bool okNow = afterDelay && wn >= CAL_WIN_MIN_N && !isnan(sC) &&
+                       fabsf(sC) < CAL_SLOPE_CO2 &&
+                       !isnan(rms) && rms < CAL_RESID_MAX &&
+                       (isnan(sT) || fabsf(sT) < CAL_SLOPE_T);
+    if (!okNow) okSince = 0;
+    else if (!okSince) okSince = now ? now : 1;
+    const bool stable = okSince && (now - okSince) >= CAL_HOLD_MS &&
+                        (el - delayMs) >= CAL_MIN_MS;
+    v.slope = afterDelay ? sC : NAN;
+    v.phase = !afterDelay ? CALV_DELAY : (stable ? CALV_STABLE : CALV_SETTLE);
+    v.secs  = !afterDelay ? (delayMs - el + 999UL) / 1000UL : (el - delayMs) / 1000UL;
+
+    if (stable) {
+      char fts[12];
+      Serial.printf("Kalibrace: ustaleno po %lu s mereni (sklon CO2 %.1f ppm/min,"
+                    " rozptyl %.1f ppm, T %s C/min), prumer %.0f ppm.\n",
+                    (unsigned long)((el - delayMs) / 1000UL), sC, rms,
+                    calFmt(fts, sizeof(fts), sT, "%.2f"), mean);
+      status = CAL_OK;
+      break;
+    }
+    if (afterDelay && (el - delayMs) >= CAL_MAX_MS) {
+      char fs[12], fr[12], fts[12];
+      Serial.printf("Kalibrace: za %lu min se hodnoty neustalily (sklon CO2 %s ppm/min,"
+                    " rozptyl %s ppm, T %s C/min).\n", (unsigned long)(CAL_MAX_MS / 60000UL),
+                    calFmt(fs, sizeof(fs), sC, "%.1f"), calFmt(fr, sizeof(fr), rms, "%.1f"),
+                    calFmt(fts, sizeof(fts), sT, "%.2f"));
+      status = (wn < CAL_WIN_MIN_N) ? CAL_E_SHOTS : CAL_E_UNSTABLE;
+      break;
+    }
+
+    // --- prubeh: displej a seriova linka ---
+    if (now - lastDraw >= CAL_DRAW_MS) {
+      lastDraw = now;
+      char fc[12], fs[12], fr[12], ft[12], fts[12];
+      calFmt(fc, sizeof(fc), v.co2, "%.0f");
+      if (!afterDelay)
+        Serial.printf("Kalibrace: odpocet %lu s, CO2 %s ppm\n", (unsigned long)v.secs, fc);
+      else
+        Serial.printf("Kalibrace: mereni %lu s, CO2 %s ppm, sklon %s ppm/min,"
+                      " rozptyl %s ppm, T %s C (%s C/min)\n", (unsigned long)v.secs, fc,
+                      calFmt(fs, sizeof(fs), sC, "%.1f"), calFmt(fr, sizeof(fr), rms, "%.1f"),
+                      calFmt(ft, sizeof(ft), v.tc, "%.1f"), calFmt(fts, sizeof(fts), sT, "%.2f"));
+      calProgress(v);
+    }
+
+    // --- do dalsiho vzorku ---
+    int32_t wait = (int32_t)(nextSample - millis());
+    if (wait > 0) delay(wait > 1000 ? 1000 : (uint32_t)wait);
+  }
+
+  if (status == CAL_OK && abs(corrExp) > CAL_MAX_CORR)
+    Serial.printf("Kalibrace: korekce vyjde asi %ld ppm - neobvykle velka, ale provede se.\n",
+                  (long)corrExp);
+  return status;
+}
+
+// Jeden single shot SCD41: spustit, pockat na data, precist. Hodnoty si
+// knihovna drzi v sobe (getCO2 / getTemperature / getHumidity).
+static bool scd41Shot() {
+  if (!scd4x.measureSingleShot()) return false;
+  unsigned long t0 = millis();
+  while (millis() - t0 < SCD_TIMEOUT_MS) {
+    delay(100);
+    if (scd4x.getDataReadyStatus()) return scd4x.readMeasurement();
+  }
+  return false;
+}
+
+// Vzorek pro calRun(): jeden single shot SCD41 (~5 s).
+static bool scd41CalSample(float &co2, float &tc) {
+  if (!scd41Shot()) return false;
+  co2 = scd4x.getCO2();
+  tc  = scd4x.getTemperature();
+  return co2 > 0;
+}
+
 void readSCD41(Reading &r) {
+  const bool wantFrc = (pendingCo2Ref >= 0);
+
   // begin(port, measBegin, autoCalibrate):
   //   measBegin=false  -> nespoustet periodicke mereni (setri energii),
   //                       pouzijeme jednorazovy single shot
   //   autoCalibrate    -> ASC podle konfigurace
   // begin() sam zastavi pripadne bezici periodicke mereni.
-  if (!scd4x.begin(Wire, false, cfg.scdAsc != 0)) return;
+  //
+  // Jedno zopakovani: begin() ANDuje ctyri operace (stop, seriove cislo
+  // s kontrolou CRC, zapis ASC a jeho zpetne cteni), takze ho shodi i jedno
+  // zaruseni I2C - a s nim cele mereni CO2 v tomto cyklu.
+  bool ok = scd4x.begin(Wire, false, cfg.scdAsc != 0);
+  if (!ok) { delay(50); ok = scd4x.begin(Wire, false, cfg.scdAsc != 0); }
+  if (!ok) {
+    Serial.println("SCD41 neodpovida.");
+    // Drive tu byl tichy return PRED obsluhou kalibrace: pozadavek zmizel bez
+    // jedine hlasky, a protoze neni v RTC RAM, deep sleep ho zahodil.
+    if (wantFrc) calFinish("SCD41", CAL_E_NORESP, 0, r.vbat);
+    return;
+  }
 
-  // Nadmorska vyska zpresnuje vypocet CO2 primo v cidle.
-  if (cfg.altitude > 0) scd4x.setSensorAltitude((uint16_t)cfg.altitude);
+  // Kompenzace CO2 tlakem. Skutecny tlak z barometru je lepsi nez nadmorska
+  // vyska, protoze zohledni i pocasi. Kdyz barometr neni, zbyde vyska.
+  //
+  // set_ambient_pressure je podle datasheetu volatilni - po kazdem zapnuti
+  // se musi poslat znovu, coz je presne nase situace (cidlo se mezi merenimi
+  // odpojuje). Knihovna chce PASCALY.
+  //
+  // POZOR: tlak, jak ho cidlo opravdu vidi (r.pressRaw), NE prepocteny na
+  // hladinu more. Barometr se proto v doMeasurement() cte PRED SCD41 - drive
+  // to bylo naopak a SCD41 tlak nedostal nikdy, prestoze to README slibovalo.
+  //
+  // Vyska se posila VZDY a tlak az po ni: podle datasheetu tlak vysku
+  // prebije, a kdyby cidlo set_ambient_pressure v klidovem rezimu odmitlo,
+  // zustane aspon kompenzace vyskou jako drive.
+  if (cfg.altitude > 0)
+    scd4x.setSensorAltitude((uint16_t)cfg.altitude);
+  if (!isnan(r.pressRaw) && r.pressRaw > 300.0f && r.pressRaw < 1200.0f)
+    scd4x.setAmbientPressure(r.pressRaw * 100.0f);
 
-  // Jednorazova kalibrace na znamou koncentraci, pokud byla vyzadana.
-  if (pendingCo2Ref >= 0) {
-    scd4x.stopPeriodicMeasurement();
-    float corr = 0;
-    if (scd4x.performForcedRecalibration((uint16_t)pendingCo2Ref, &corr))
-      Serial.printf("FRC hotova, korekce %.1f ppm\n", corr);
-    else
-      Serial.println("FRC selhala - cidlo musi bezet 3+ min ve stalem prostredi.");
-    pendingCo2Ref = -1;
+  // --- Jednorazova kalibrace na znamou koncentraci (FRC) ---
+  //
+  // Datasheet SCD4x, postup FRC:
+  //   1. "Operate the SCD4x in the operation mode later used in normal sensor
+  //      operation (...) for > 3 minutes in an environment with homogenous
+  //      and constant CO2 concentration."
+  //   2. stop_periodic_measurement, pockat 500 ms
+  //   3. perform_forced_recalibration, po 400 ms precist korekci;
+  //      0xFFFF znamena, ze FRC selhala
+  //
+  // Krok 1 resi calRun(): single shoty (bezny rezim tady) tak dlouho, az se
+  // CO2 i teplota ustali - viz komentar u CAL_* konstant, proc pevne 3 minuty
+  // od zapnuti nestaci. Korekci si cidlo samo ulozi do EEPROM (datasheet:
+  // "field calibration history (i.e. FRC and ASC) is automatically stored"),
+  // takze prezije odpojeni napajeni i bez persist_settings.
+  if (wantFrc) {
+    int32_t corrExp = 0;
+    const uint8_t st = calRun("SCD41", scd41CalSample, corrExp);
+    if (st != CAL_OK) {
+      calFinish("SCD41", st, corrExp, r.vbat);
+    } else {
+      // Krok 2. V rezimu single shot neni co zastavovat, ale je to predepsany
+      // krok a knihovna si 500 ms pocka sama.
+      scd4x.stopPeriodicMeasurement();
+      float corr = 0;
+      if (scd4x.performForcedRecalibration((uint16_t)pendingCo2Ref, &corr)) {
+        Serial.printf("FRC hotova, korekce %.1f ppm\n", corr);
+        calFinish("SCD41", CAL_OK, (int32_t)lroundf(corr), r.vbat);
+      } else {
+        Serial.println("FRC selhala - cidlo kalibraci odmitlo.");
+        calFinish("SCD41", CAL_E_FRC, 0, r.vbat);
+      }
+    }
   }
 
   // DVA single shoty, pouzije se az druhy.
@@ -1683,18 +2276,8 @@ void readSCD41(Reading &r) {
   // odectena hodnota je vzdy ta, kterou ma clovek zahodit. Bez toho cidlo
   // hlasi porad skoro totez cislo blizko vychozi kalibrace bez ohledu na
   // skutecny vzduch. Stoji to ~5 s navic, ale jinak je udaj bezcenny.
-  bool ready = false;
-  for (uint8_t pass = 0; pass < 2; pass++) {
-    if (!scd4x.measureSingleShot()) return;
-    ready = false;
-    unsigned long t0 = millis();
-    while (millis() - t0 < SCD_TIMEOUT_MS) {
-      delay(100);
-      if (scd4x.getDataReadyStatus()) { ready = true; break; }
-    }
-    if (!ready) return;
-    if (!scd4x.readMeasurement()) return;
-  }
+  for (uint8_t pass = 0; pass < 2; pass++)
+    if (!scd41Shot()) return;
 
   uint16_t co2 = scd4x.getCO2();
   if (co2 == 0) return;
@@ -1703,6 +2286,30 @@ void readSCD41(Reading &r) {
   // ktery se pouzije, rozhoduje az mergeSources().
   r.tScd = scd4x.getTemperature();
   r.hScd = scd4x.getHumidity();
+}
+
+// Obnoveni tovarni kalibrace SCD41 (perform_factory_reset). Datasheet: "resets
+// all configuration settings stored in the EEPROM and erases the FRC and ASC
+// algorithm history". Druha cesta z rozladeneho stavu vedle nove kalibrace -
+// nepotrebuje referenci ani cestu ven, a hodi se k diagnostice: po resetu je
+// hned videt, co cidlo meri bez vsech predchozich kalibraci.
+//
+// Reset vrati v EEPROM i samokalibraci na vychozi "zapnuto". Nevadi to:
+// readSCD41() ji pri kazdem startu nastavi podle cfg.scdAsc v begin().
+// U SEN6x ekvivalent, ktery by mazal historii FRC, datasheet nepopisuje.
+bool scd41FactoryReset() {
+  if (!det.scd41) return false;
+  bool ok = scd4x.begin(Wire, false, cfg.scdAsc != 0);
+  if (!ok) { delay(50); ok = scd4x.begin(Wire, false, cfg.scdAsc != 0); }
+  if (!ok) { Serial.println("SCD41 neodpovida - tovarni kalibrace neobnovena."); return false; }
+  if (!scd4x.performFactoryReset()) {          // knihovna pocka predepsanych 1200 ms
+    Serial.println("SCD41 tovarni reset odmitlo.");
+    return false;
+  }
+  scd4x.setAutomaticSelfCalibrationEnabled(cfg.scdAsc != 0);
+  // Naplanovanou kalibraci (pendingCo2Ref) reset nerusi - calRecord, ne calFinish.
+  calRecord("SCD41", CAL_RESET, 0, 0, NAN);
+  return true;
 }
 
 // Prepocet na hladinu more + uzivatelsky offset. POUZIVA SE JEN PRO ZOBRAZENI.
@@ -1821,6 +2428,19 @@ static bool senDueAtTick(uint16_t tick) {
   return (tick % cfg.senMult) == 0;
 }
 
+// Vzorek pro calRun(): SEN6x meri nepretrzite a CO2 obnovuje po ~5 s,
+// takze staci pockat na data a precist. Dokud clanek CO2 nenabehne (u SEN63C
+// az ~24 s), hlasi neplatnou hodnotu - to calRun() bere jako neuspesny vzorek.
+static bool sen6xCalSample(float &co2, float &tc) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < 2000 && !sen6xDataReady()) delay(100);
+  Reading x;
+  if (!sen6xReadValues(x)) return false;
+  co2 = x.co2Sen;
+  tc  = x.tSen;
+  return !isnan(co2);
+}
+
 void readSen6x(Reading &r) {
   if (!det.sen6x) return;
 
@@ -1829,7 +2449,17 @@ void readSen6x(Reading &r) {
   // nasobky (1, 2, 3, 4), takze se faze nikdy neposune pretecenim.
   senTick = (uint16_t)((senTick + 1) % 12);
 
-  if (!senDueAtTick(myTick)) {
+  // Kalibrace CO2 - jen kdyz CO2 opravdu dodava SEN6x (SCD41 ma prednost
+  // a kalibruje se v readSCD41). Zjistuje se UZ TADY, pred vsemi navraty:
+  // kazdy z nich drive pozadavek tise zahodil.
+  const bool wantFrc = (pendingCo2Ref >= 0 && senHasCo2() && !det.scd41);
+  const char *calName = senKindName(senKind);
+
+  // Pozadavek na kalibraci ma prednost pred nasobkem intervalu. Drive se pri
+  // senmult > 1 v preskocenem cyklu vratilo drive, nez se ke kalibraci
+  // doslo - a protoze servis i hotspot konci tvrdym startem s nejistou fazi
+  // pocitadla, u senmult=3 to byly dve sance ze tri, ze se nestane nic.
+  if (!senDueAtTick(myTick) && !wantFrc) {
     Serial.printf("SEN6x: preskoceno (nasobek %dx, tik %u) - PM a CO2 az za %d min.\n",
                   cfg.senMult, myTick,
                   cfg.intervalMin * (cfg.senMult - (myTick % cfg.senMult)));
@@ -1838,9 +2468,11 @@ void readSen6x(Reading &r) {
 
   // Ochrana proti podpeti: rozbeh ventilatoru je proudova spicka pres 100 mA
   // a na vybite baterii by shodil celou desku (brownout uprostred zapisu
-  // do flash je nejhorsi myslitelny okamzik).
+  // do flash je nejhorsi myslitelny okamzik). Plati i pro kalibraci - ta by
+  // navic tocila ventilatorem i nekolik minut.
   if (!isnan(r.vbat) && r.vbat < SEN_VBAT_MIN) {
     Serial.printf("SEN6x preskocen: baterie %.2f V < %.2f V.\n", r.vbat, SEN_VBAT_MIN);
+    if (wantFrc) calFinish(calName, CAL_E_LOWBAT, 0, r.vbat);
     return;
   }
 
@@ -1877,20 +2509,18 @@ void readSen6x(Reading &r) {
 
   if (!sen6xStart()) {
     Serial.println("SEN6x: mereni se nepodarilo spustit.");
+    if (wantFrc) calFinish(calName, CAL_E_START, 0, r.vbat);
     return;
   }
 
   uint32_t warmMs = (uint32_t)cfg.senWarmS * 1000UL;
 
-  // Kalibrace CO2 je vyjimka: datasheet zada aspon 3 minuty behu ve stalem
-  // prostredi. Jednorazove tedy zahrivani prodlouzime, jinak by FRC selhala
-  // nebo (hure) prosla se spatnou referenci.
-  bool wantFrc = (pendingCo2Ref >= 0 && senHasCo2() && !det.scd41);
-  if (wantFrc) {
-    warmMs = 210000UL;              // 3,5 minuty
-    Serial.println("SEN6x: kalibrace CO2 - cidlo pobezi 3,5 min. Nechte ho"
-                   " v ustalenem prostredi.");
-  }
+  // Kalibrace CO2: datasheet zada aspon 3 minuty behu ve stalem prostredi.
+  // calRun() nechava cidlo merit, dokud se CO2 i teplota neustali (viz CAL_*).
+  // Bezne zahrivani tim davno ubehne, takze senWaitWarmup() hned skonci.
+  uint8_t calSt = CAL_E_START;
+  int32_t calCorrExp = 0;
+  if (wantFrc) calSt = calRun(calName, sen6xCalSample, calCorrExp);
 
   senWaitWarmup(warmMs);
 
@@ -1928,14 +2558,17 @@ void readSen6x(Reading &r) {
 
   sen6xStop();                      // FRC datasheet chce po zastaveni mereni
 
-  if (wantFrc) {
+  if (wantFrc && calSt != CAL_OK) {
+    calFinish(calName, calSt, calCorrExp, r.vbat);
+  } else if (wantFrc) {
     int32_t corr = 0;
-    if (sen6xForcedCo2((uint16_t)pendingCo2Ref, corr))
+    if (sen6xForcedCo2((uint16_t)pendingCo2Ref, corr)) {
       Serial.printf("SEN6x FRC hotova, korekce %ld ppm\n", (long)corr);
-    else
-      Serial.println("SEN6x FRC selhala - cidlo musi bezet aspon 3 min"
-                     " ve stalem prostredi.");
-    pendingCo2Ref = -1;
+      calFinish(calName, CAL_OK, corr, r.vbat);
+    } else {
+      Serial.println("SEN6x FRC selhala - cidlo kalibraci odmitlo.");
+      calFinish(calName, CAL_E_FRC, 0, r.vbat);
+    }
   }
 }
 
@@ -2044,14 +2677,23 @@ Reading doMeasurement() {
   // namereny pokles vypadal jako vybita baterie.
   r.vbat = readVBat();
   readSHT40(r);
-  if (det.scd41)                 readSCD41(r);
-  // Barometr PRED SEN6x: jeho tlak se posila do SEN6x jako vstup pro
-  // kompenzaci CO2, takze uz musi byt zmereny.
+  // Barometr PRED obema cidly CO2: jeho tlak se posila do SCD41 i do SEN6x
+  // jako vstup pro kompenzaci CO2, takze uz musi byt zmereny. Drive byl
+  // az za SCD41, ktery proto tlak nedostal nikdy.
   if (det.bosch != BOSCH_NONE)   readBosch(r);
+  if (det.scd41)                 readSCD41(r);
   if (det.ds18b20)               readDS18B20(r);
   // SEN6x uplne nakonec - je zdaleka nejpomalejsi a nejzravejsi, at se
   // ventilator toci co nejkratsi dobu.
   if (det.sen6x)                 readSen6x(r);
+
+  // Pojistka: pozadavek na kalibraci CO2 nesmi tise zmizet. Kazda cesta ve
+  // readSCD41/readSen6x ho uz ukoncuje pres calFinish(); kdyby presto zbyl
+  // (napr. v sestave neni nic, co by CO2 meril), aspon se to dozvime.
+  if (pendingCo2Ref >= 0) {
+    const char *n = calSensorName();
+    calFinish(n ? n : "CO2", CAL_E_NORESP, 0, r.vbat);
+  }
 
   mergeSources(r);
   return r;
@@ -2060,21 +2702,37 @@ Reading doMeasurement() {
 // ============================================================================
 // KRESLENI
 // ============================================================================
-void drawDashedLine(int x0, int y0, int x1, int y1, int dash, int gap) {
+// Carkovana / teckovana cara se spojitou fazi.
+//
+// POZOR, tohle je duvod, proc funkce ma parametr phase: prubeh grafu se
+// kresli po usecich mezi SOUSEDNIMI VZORKY a tech je az 2016 na 410 px, tedy
+// usec byva kratsi nez pixel. Kdyby kazdy usec zacinal vzor od zacatku (a tak
+// to puvodni drawDashedLine delala), zacal by vzdy "perem dole" a cara by
+// vysla plna - tri slouceny krivky by pak byly k nerozeznani.
+//
+// phase je ujeta vzdalenost v ramci cyklu dash+gap; volajici si ji nese pres
+// celou krivku a funkce ji posouva.
+void drawDashedLine(int x0, int y0, int x1, int y1, int dash, int gap, float &phase) {
+  const float per = (float)(dash + gap);
   float dx = x1 - x0, dy = y1 - y0;
   float len = sqrtf(dx * dx + dy * dy);
-  if (len < 1.0f) { display.drawPixel(x0, y0, GxEPD_BLACK); return; }
+  if (len < 0.001f) {
+    if (fmodf(phase, per) < (float)dash) display.drawPixel(x0, y0, GxEPD_BLACK);
+    return;
+  }
   float ux = dx / len, uy = dy / len, pos = 0;
-  bool draw = true;
   while (pos < len) {
-    float end = pos + (draw ? dash : gap);
+    float ph = fmodf(phase + pos, per);
+    bool on = (ph < (float)dash);
+    float end = pos + (on ? ((float)dash - ph) : (per - ph));
     if (end > len) end = len;
-    if (draw)
+    if (on)
       display.drawLine(x0 + (int)lroundf(ux*pos), y0 + (int)lroundf(uy*pos),
                        x0 + (int)lroundf(ux*end), y0 + (int)lroundf(uy*end),
                        GxEPD_BLACK);
-    pos = end; draw = !draw;
+    pos = end;
   }
+  phase = fmodf(phase + len, per);
 }
 
 // ============================================================================
@@ -2355,9 +3013,16 @@ void drawHeader(const Reading &r, float vb) {
   }
   // Varovani o baterii je dulezitejsi nez posledni radek seznamu - kdyz uz
   // pro nej neni misto, prepise posledni vypsany radek.
+  //
+  // Mazaci obdelnik musi pokryt CELY predchozi radek. Drive zacinal na
+  // wy-12, jenze pri peti cidlech konci varovani jen 4 px pod predchozi
+  // uctarou (ry uz preteklo RY_MAX, takze se wy srazi zpet na RY_MAX)
+  // a horni ctyri rady pixelu radku "interval 5 min" zustavaly videt jako
+  // prouzek nad varovanim. Devitka ma dotah 13 px, takze mazeme od wy-16.
+  // Dolni hrana smi az na HDR_LINE_Y - delici cara se kresli az potom.
   if (!isnan(vb) && vb < VBAT_LOW) {
     int wy = (ry <= RY_MAX) ? ry : RY_MAX;
-    display.fillRect(W / 2, wy - 12, W / 2 - 18, 15, GxEPD_WHITE);
+    display.fillRect(W / 2, wy - 16, W / 2 - 18, 20, GxEPD_WHITE);
     drawRight("BATERIE SLABA", W - 20, wy);
   }
 
@@ -2512,37 +3177,37 @@ static uint16_t histStep(uint8_t ch) {
   return bestN ? best : 1;
 }
 
-void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
-  const int gBottom = gy + gh, gRight = gx + gw;
-  Quantity q = channels[ch].q;
-  uint32_t spanMin = histSpanMin();
+// ---------------------------------------------------------------------------
+// ROZSAH OSY Y
+// Drive to byl switch primo v kreslici funkci. Je z nej samostatna funkce,
+// protoze slouceny panel ji vola nad sjednocenymi extremy vic serii.
+//
+// Zaroven se tim opravila stara chyba: switch vetvil podle Quantity a vlhkosti
+// jednotlivych cidel (hum.sht az hum.bme) padaly do vetve "default", tedy mezi
+// teploty. Dostavaly proto minimalni rozpeti 2 misto 5 %RH a zaokrouhlovaly se
+// po pul jednotce - drobny sum vlhkosti tak vypadal jako velky vykyv.
+// ---------------------------------------------------------------------------
+void axisRange(AxisClass ac, float dataMin, float dataMax, bool any,
+               float &mn, float &mx) {
+  mn = any ? dataMin : 0.0f;
+  mx = any ? dataMax : 1.0f;
 
-  // --- rozsah osy Y: kazda velicina ma jinou rozumnou rezervu ---
-  float mn = 1e9f, mx = -1e9f; bool any = false;
-  for (uint16_t i = 0; i < histCount; i++) {
-    float v = storeToVal(q, histAt(ch, i));
-    if (!isnan(v)) { any = true; if (v < mn) mn = v; if (v > mx) mx = v; }
-  }
-  const float dataMin = mn, dataMax = mx;   // syrove extremy pred rozsirenim osy
-  if (!any) { mn = 0; mx = 1; }
-
-  float minSpan;                     // nejmensi rozumny rozsah osy
-  switch (q) {
-    case Q_CO2:
+  float minSpan;
+  switch (ac) {
+    case AX_CO2:
       mn = floorf(mn / 50) * 50 - 25;  mx = ceilf(mx / 50) * 50 + 25;
       minSpan = 100.0f; break;
-    case Q_PRESS:
+    case AX_PRESS:
       mn = floorf(mn) - 1;             mx = ceilf(mx) + 1;
       minSpan = 4.0f; break;
-    case Q_VBAT:
+    case AX_VBAT:
       // Baterie se meni pomalu - hruba osa by ukazovala rovnou caru.
       mn -= 0.05f;                     mx += 0.05f;
       minSpan = 0.20f; break;
-    case Q_HUM:
+    case AX_HUM:
       mn = floorf(mn) - 1;             mx = ceilf(mx) + 1;
       minSpan = 5.0f; break;
-    case Q_PM25:
-    case Q_PM10:
+    case AX_PM:
       // Prach byva vetsinu casu u nuly a obcas vyskoci. Osa proto zacina
       // na nule - jinak by kazdy sum vypadal jako smogova epizoda.
       //
@@ -2554,36 +3219,242 @@ void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
       mx = any ? niceCeil(dataMax * 1.25f) : 1.0f;
       minSpan = 0.5f;                  // uplne plocha nula je stale citelna
       break;
-    default:                            // teploty
+    default:                           // teploty
       mn = floorf(mn) - 0.5f;          mx = ceilf(mx) + 0.5f;
       minSpan = 2.0f; break;
   }
   if (mx - mn < minSpan) { float c = (mn + mx) / 2; mn = c - minSpan/2; mx = c + minSpan/2; }
   // Zaporny prach neexistuje - dorovnani rozsahu vyse by ho dokazalo
   // pod nulu poslat.
-  if ((q == Q_PM25 || q == Q_PM10) && mn < 0) { mx -= mn; mn = 0; }
+  if (ac == AX_PM && mn < 0) { mx -= mn; mn = 0; }
+}
 
-  // --- radek nad grafem: vlevo velicina, vpravo extremy za obdobi ---
-  char title[56];
-  snprintf(title, sizeof(title), "%s [%s]", qLabel(q), qUnit(q));
+// Kratke jmeno serie pro popisek na konci krivky a pro zahlavi sloucenych
+// panelu. Musi byt kratke (kresli se dovnitr grafu) a musi rikat, ze KTEREHO
+// CIDLA hodnota je - to je u sloucenych teplot jedina informace, ktera je
+// odlisi. Jen ASCII, fonty GFX nic jineho neumeji.
+const char* qShort(Quantity q) {
+  switch (q) {
+    case Q_TEMP:  return (tsrcPrimary() < TSRC_COUNT) ? tsrcName(tsrcPrimary()) : "Teplota";
+    case Q_HUM:   return (hsrcPrimary() < HSRC_COUNT) ? hsrcName(hsrcPrimary()) : "Vlhkost";
+    case Q_TEMP2: return tsrcName(TSRC_DS);
+    case Q_T_SHT: case Q_H_SHT: return tsrcName(TSRC_SHT);
+    case Q_T_SEN: case Q_H_SEN: return tsrcName(TSRC_SEN);
+    case Q_T_SCD: case Q_H_SCD: return tsrcName(TSRC_SCD);
+    case Q_T_BME: case Q_H_BME: return tsrcName(TSRC_BOSCH);
+    case Q_CO2:   return "CO2";
+    case Q_PM25:  return "PM2.5";
+    case Q_PM10:  return "PM10";
+    case Q_PRESS: return "Tlak";
+    case Q_VBAT:  return "Bat";
+    default:      return "?";
+  }
+}
+
+// Sirka pruhu vpravo pro druhou osu Y. Nejsirsi popisek je tlak (1013.5),
+// devitkou asi 44 px; 48 nechava rezervu. Rezervuje se VSEM panelum najednou,
+// aby mely grafy stejnou sirku - ruzne siroke ramy pod sebou vypadaji jako
+// chyba vykresleni.
+#define RIGHT_AXIS_W  48
+
+// Kolikrat smi byt spolecny rozsah vetsi nez nejvetsi rozsah jedne serie,
+// nez to prestane davat smysl. Pokojova (rozpeti 2 °C) a venkovni teplota
+// v mrazech (7 °C) daji spolecne 38 °C, tedy 5,4x - na to varujeme. Dve
+// pokojova cidla vyjdou kolem 2x a projdou.
+
+// ---------------------------------------------------------------------------
+// JEDEN PANEL GRAFU
+//
+// Panel kresli 1 az 3 krivky. Pri jedne se chova presne jako drive, jen
+// pod jinym jmenem - to je zamer, aby se nesloucena konfigurace (tedy
+// vychozi stav a vse, co lidem bezi dnes) vykreslila bajt po bajtu stejne.
+//
+// Rozliseni krivek: e-ink nema barvu ani odecet dotykem, takze vsechno musi
+// byt primo v obrazku. Nese to styl cary (plna, carkovana, teckovana)
+// a legenda NAD ramem s ukazkou cary, jmenem cidla a min/max. Do plochy
+// grafu se nepise, aby popisky nezakryvaly posledni namerene hodnoty.
+// ---------------------------------------------------------------------------
+// Ukazka stylu cary do legendy sloucenych grafu - stejny vzor jako krivka.
+#define SAMPLE_W 22
+void drawStyleSample(int x, int y, uint8_t style) {
+  float ph = 0;
+  if (style == CH_DASHED)      drawDashedLine(x, y, x + SAMPLE_W, y, 6, 5, ph);
+  else if (style == CH_DOTTED) drawDashedLine(x, y, x + SAMPLE_W, y, 2, 4, ph);
+  else {
+    display.drawLine(x, y, x + SAMPLE_W, y, GxEPD_BLACK);
+    display.drawLine(x, y - 1, x + SAMPLE_W, y - 1, GxEPD_BLACK);
+  }
+}
+
+// Spolecny nazev veliciny pro sloucene grafy se spolecnou osou
+// ("Teplota", ne "Teplota - SHT40" - cidla jsou v legende).
+const char* axisClassName(AxisClass a) {
+  switch (a) {
+    case AX_TEMP:  return "Teplota";
+    case AX_HUM:   return "Vlhkost";
+    case AX_CO2:   return "CO2";
+    case AX_PRESS: return "Tlak";
+    case AX_VBAT:  return "Baterie";
+    case AX_PM:    return "Prach";
+    default:       return "";
+  }
+}
+
+void drawPlot(uint8_t pi, int gx, int gy, int gw, int gh) {
+  if (pi >= plotCount) return;
+  const Plot &p    = plots[pi];
+  const int gBottom = gy + gh, gRight = gx + gw;
+  const bool dual  = plotDualAxis(pi);
+  uint32_t spanMin = histSpanMin();
+
+  // --- extremy jednotlivych serii ---
+  float sMin[MAX_PER_PLOT], sMax[MAX_PER_PLOT];
+  bool  sAny[MAX_PER_PLOT];
+  for (uint8_t s = 0; s < p.n; s++) {
+    Quantity q = channels[p.first + s].q;
+    sMin[s] = 1e9f; sMax[s] = -1e9f; sAny[s] = false;
+    for (uint16_t i = 0; i < histCount; i++) {
+      float v = storeToVal(q, histAt(p.first + s, i));
+      if (!isnan(v)) { sAny[s] = true;
+                       if (v < sMin[s]) sMin[s] = v;
+                       if (v > sMax[s]) sMax[s] = v; }
+    }
+  }
+
+  // --- osy ---
+  // Pri spolecne ose maji vsechny serie index 0, pri dvou osach ma serie s
+  // svou vlastni. Vic nez dve osy nevznikne - hlida to buildPlots().
+  float axMn[2], axMx[2];
+  uint8_t axOf[MAX_PER_PLOT];
+  if (dual) {
+    for (uint8_t s = 0; s < p.n && s < 2; s++) {
+      axOf[s] = s;
+      axisRange(qAxisClass(channels[p.first + s].q), sMin[s], sMax[s], sAny[s],
+                axMn[s], axMx[s]);
+    }
+  } else {
+    float mn = 1e9f, mx = -1e9f; bool any = false;
+    for (uint8_t s = 0; s < p.n; s++) {
+      axOf[s] = 0;
+      if (!sAny[s]) continue;
+      any = true;
+      if (sMin[s] < mn) mn = sMin[s];
+      if (sMax[s] > mx) mx = sMax[s];
+    }
+    axisRange(qAxisClass(channels[p.first].q), mn, mx, any, axMn[0], axMx[0]);
+    axMn[1] = axMn[0]; axMx[1] = axMx[0];
+  }
+
+  // --- formatovani hodnot (podle tridy osy, ne podle jednotlivych velicin) ---
+  const AxisClass ac0 = qAxisClass(channels[p.first].q);
+  auto fmtFor = [&](uint8_t ax, float v, char *o, size_t n) {
+    AxisClass ac = dual ? qAxisClass(channels[p.first + ax].q) : ac0;
+    // U velmi malych rozsahu (cisty vzduch, PM v desetinach) by jedno
+    // desetinne misto slepilo vsechny popisky na "0.0".
+    bool fine = (axMx[ax] - axMn[ax]) < 2.0f;
+    if (ac == AX_CO2)       snprintf(o, n, "%d", (int)lroundf(v));
+    else if (ac == AX_VBAT) snprintf(o, n, "%.2f", v);
+    else if (fine)          snprintf(o, n, "%.2f", v);
+    else                    snprintf(o, n, "%.1f", v);
+  };
+
+  // --- radek nad grafem ---
+  // Sloucene grafy nesou legendu tady, nad ramem: ukazka cary (plna,
+  // carkovana, teckovana) a jmeno cidla. Do plochy grafu se nic nepise,
+  // takze popisky nezakryvaji posledni namerene hodnoty.
   useFont(&FreeSans9pt7b);
-  richPrint(gx, gy - 8, title);
+  const int legY = gy - 13;                     // stred textu nad ramem
+  char title[64];
+  if (p.n > 1 && !dual)
+    snprintf(title, sizeof(title), "%s [%s]", axisClassName(ac0), qUnit(channels[p.first].q));
+  else
+    snprintf(title, sizeof(title), "%s [%s]",
+             qLabel(channels[p.first].q), qUnit(channels[p.first].q));
+  // Spolecna osa, vic serii: legenda vpravo, u kazde serie min a max za
+  // obdobi. Aby se cisla vesla, zkracuje se nejdriv nadpis na samotnou
+  // jednotku (cidla i velicinu rika legenda), az potom se cisla vynechaji -
+  // identita je dulezitejsi nez cisla.
+  const bool legend = (p.n > 1 && !dual);
+  const int SEP = 12;
+  char full[MAX_PER_PLOT][32], names[MAX_PER_PLOT][16];
+  bool useFull = false;
+  int  lw = 0;
+  if (legend) {
+    for (uint8_t s = 0; s < p.n; s++) {
+      char lo[14], hi[14];
+      const char *nm = qShort(channels[p.first + s].q);
+      if (sAny[s]) {
+        fmtFor(0, sMin[s], lo, sizeof(lo)); fmtFor(0, sMax[s], hi, sizeof(hi));
+        // ".." misto pomlcky: u zapornych hodnot by vyslo "-19.3--8.2".
+        snprintf(full[s], sizeof(full[0]), "%s %s..%s", nm, lo, hi);
+      } else {
+        snprintf(full[s], sizeof(full[0]), "%s", nm);
+      }
+      snprintf(names[s], sizeof(names[0]), "%s", nm);
+    }
+    auto legWidth = [&](bool f) {
+      int w = 0;
+      for (uint8_t s = 0; s < p.n; s++)
+        w += (s ? SEP : 0) + SAMPLE_W + 5 + richWidth(f ? full[s] : names[s]);
+      return w;
+    };
+    char unitOnly[16];
+    snprintf(unitOnly, sizeof(unitOnly), "%s", qUnit(channels[p.first].q));
+    if (gx + richWidth(title) + 10 + legWidth(true) + 4 <= gRight) {
+      useFull = true;
+    } else if (gx + richWidth(unitOnly) + 10 + legWidth(true) + 4 <= gRight) {
+      useFull = true;
+      strcpy(title, unitOnly);
+    }
+    lw = legWidth(useFull);
+  }
 
-  if (any) {
-    char lo[14], hi[14], mm[40];
-    if (q == Q_CO2)       { snprintf(lo, sizeof(lo), "%d", (int)lroundf(dataMin));
-                            snprintf(hi, sizeof(hi), "%d", (int)lroundf(dataMax)); }
-    else if (q == Q_VBAT) { snprintf(lo, sizeof(lo), "%.2f", dataMin);
-                            snprintf(hi, sizeof(hi), "%.2f", dataMax); }
-    else                  { snprintf(lo, sizeof(lo), "%.1f", dataMin);
-                            snprintf(hi, sizeof(hi), "%.1f", dataMax); }
-    snprintf(mm, sizeof(mm), "min %s | max %s", lo, hi);
-    int16_t mx1, my1; uint16_t mw, mh;
-    display.getTextBounds(mm, 0, 0, &mx1, &my1, &mw, &mh);
-    // 4 px rezerva - getTextBounds vraci tesny obrys, skutecny posun
-    // kurzoru byva o par pixelu vetsi.
-    display.setCursor(gRight - mw - 4, gy - 8);
-    display.print(mm);
+  int tx0 = gx;
+  if (dual) {                                   // leva osa = prvni serie
+    drawStyleSample(gx, legY, channels[p.first].style);
+    tx0 = gx + SAMPLE_W + 5;
+  }
+  richPrint(tx0, gy - 8, title);
+  const int titleRight = tx0 + richWidth(title) + 10;   // odkud je volno
+
+  if (dual) {
+    // Druha velicina se pise vpravo, tedy nad svou osou. Poloha rika, ktera
+    // krivka ke ktere ose patri, ukazka cary to potvrzuje.
+    char t2[64];
+    snprintf(t2, sizeof(t2), "%s [%s]",
+             qLabel(channels[p.first + 1].q), qUnit(channels[p.first + 1].q));
+    int w2 = richWidth(t2);
+    int x2 = gRight + RIGHT_AXIS_W - w2;
+    if (titleRight + SAMPLE_W + 5 <= x2) {
+      drawStyleSample(x2 - SAMPLE_W - 5, legY, channels[p.first + 1].style);
+      richPrint(x2, gy - 8, t2);
+    }
+  } else if (p.n == 1) {
+    // Jedna serie: presne jako do v4.3 - extremy za obdobi vpravo.
+    if (sAny[0]) {
+      char lo[14], hi[14], mm[40];
+      fmtFor(0, sMin[0], lo, sizeof(lo));
+      fmtFor(0, sMax[0], hi, sizeof(hi));
+      snprintf(mm, sizeof(mm), "min %s | max %s", lo, hi);
+      int16_t mx1, my1; uint16_t mw, mh;
+      display.getTextBounds(mm, 0, 0, &mx1, &my1, &mw, &mh);
+      // 4 px rezerva - getTextBounds vraci tesny obrys, skutecny posun
+      // kurzoru byva o par pixelu vetsi.
+      display.setCursor(gRight - mw - 4, gy - 8);
+      display.print(mm);
+    }
+  } else {
+    if (titleRight + lw + 4 <= gRight) {
+      int x = gRight - lw - 4;
+      for (uint8_t s = 0; s < p.n; s++) {
+        if (s) x += SEP;
+        drawStyleSample(x, legY, channels[p.first + s].style);
+        x += SAMPLE_W + 5;
+        const char *t = useFull ? full[s] : names[s];
+        richPrint(x, gy - 8, t);
+        x += richWidth(t);
+      }
+    }
   }
 
   display.drawRect(gx, gy, gw, gh, GxEPD_BLACK);
@@ -2594,44 +3465,50 @@ void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
   const int plotTop = gy + labBand;
   const int plotH   = gBottom - plotTop;
 
-  auto yFor = [&](float v) -> int {
-    return gBottom - (int)((v - mn) / (mx - mn) * plotH);
+  auto yAx = [&](uint8_t a, float v) -> int {
+    return gBottom - (int)((v - axMn[a]) / (axMx[a] - axMn[a]) * plotH);
   };
+  auto yFor = [&](uint8_t s, float v) -> int { return yAx(axOf[s], v); };
   auto xFor = [&](uint16_t i) -> int {
     if (histCount <= 1) return gRight;
     return gx + (int)lroundf((float)i * gw / (histCount - 1));
   };
-  // popisek hodnoty: u desetinnych velicin jedno misto, u CO2 cele cislo.
-  // U velmi malych rozsahu (cisty vzduch, PM v desetinach) by jedno desetinne
-  // misto slepilo vsechny popisky na "0.0", proto se tam prepina na dve.
-  const bool fine = (mx - mn) < 2.0f;
-  auto fmtVal = [&](float v, char *o, size_t n) {
-    if (q == Q_CO2)       snprintf(o, n, "%d", (int)lroundf(v));
-    else if (q == Q_VBAT) snprintf(o, n, "%.2f", v);
-    else if (fine)        snprintf(o, n, "%.2f", v);
-    else                  snprintf(o, n, "%.1f", v);
-  };
 
   // --- osa Y: 3 hlavni carkovane + 2 vedlejsi teckovane mezi nimi ---
+  // Pozice se pocitaji pres yAx() ze stejneho vyrazu jako do v4.3. Vypadalo
+  // by lakave nahradit to celociselnym gBottom - plotH*i/2, jenze float
+  // roundtrip (v - mn)/(mx - mn) nevyjde presne na polovinu a u nekterych
+  // rozsahu (napr. baterie) by se cara i popisek posunuly o pixel.
   useFont(&FreeSans9pt7b);
   for (int i = 0; i <= 2; i++) {
-    float val = mn + (mx - mn) * i / 2;
-    int yy = yFor(val);
+    float val = axMn[0] + (axMx[0] - axMn[0]) * i / 2;
+    int yy = yAx(0, val);
     for (int xx = gx + 2; xx < gRight; xx += 6) display.drawPixel(xx, yy, GxEPD_BLACK);
-    char lab[12]; fmtVal(val, lab, sizeof(lab));
+
+    char lab[12]; fmtFor(0, val, lab, sizeof(lab));
     int16_t x1, y1; uint16_t bw2, bh2;
     display.getTextBounds(lab, 0, 0, &x1, &y1, &bw2, &bh2);
     display.setCursor(gx - bw2 - 4, yy + bh2 / 2);
     display.print(lab);
+
+    // Druha osa popisuje TYTEZ cary, jen svym meritkem - proto se kresli
+    // na stejnou uctaru, ne na vlastni prepocet.
+    if (dual) {
+      fmtFor(1, axMn[1] + (axMx[1] - axMn[1]) * i / 2, lab, sizeof(lab));
+      display.getTextBounds(lab, 0, 0, &x1, &y1, &bw2, &bh2);
+      display.setCursor(gRight + 5, yy + bh2 / 2);
+      display.print(lab);
+    }
   }
   // vedlejsi (mezi hlavnimi) - jemnejsi tecky, bez popisku
   for (int i = 0; i < 2; i++) {
-    float val = mn + (mx - mn) * (2 * i + 1) / 4.0f;
-    int yy = yFor(val);
+    int yy = yAx(0, axMn[0] + (axMx[0] - axMn[0]) * (2 * i + 1) / 4.0f);
     for (int xx = gx + 4; xx < gRight; xx += 12) display.drawPixel(xx, yy, GxEPD_BLACK);
   }
 
   // --- osa X: carkovane svisle linky + hodnota v danem case nahore ---
+  // Popisky hodnot patri jen PRIMARNI serii. Se tremi krivkami by jich bylo
+  // devet a v 18px pruhu by se slezly.
   for (int i = 0; i <= 2; i++) {
     int xx = gx + gw * i / 2;
     display.drawFastVLine(xx, gBottom, 4, GxEPD_BLACK);
@@ -2658,9 +3535,9 @@ void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
     if (histCount > 0) {
       uint16_t idx = (histCount <= 1) ? 0
                    : (uint16_t)lroundf((float)i * (histCount - 1) / 2.0f);
-      float v = storeToVal(q, histAt(ch, idx));
+      float v = storeToVal(channels[p.first].q, histAt(p.first, idx));
       if (!isnan(v)) {
-        char vb[14]; fmtVal(v, vb, sizeof(vb));
+        char vb[14]; fmtFor(0, v, vb, sizeof(vb));
         display.getTextBounds(vb, 0, 0, &x1, &y1, &bw2, &bh2);
         // Krajni popisky posuneme dovnitr, at nelezou na ram grafu.
         const int inset = 10;
@@ -2676,36 +3553,72 @@ void drawOneGraph(uint8_t ch, int gx, int gy, int gw, int gh) {
     }
   }
 
-  // --- prubeh: silnejsi cara (dva pixely vedle sebe) ---
+  // --- prubeh ---
   //
   // Kanal merený rid[c]eji nez ostatni (SEN6x pri senmult > 1) ma mezi vzorky
   // pravidelne mezery. Spojujeme proto i pres ne, az do typickeho rozestupu
   // kanalu - viz histStep(). Puntik zbyva jen na vzorek, ktery opravdu nema
   // souseda: jedno mereni po delsim vypadku cidla.
-  const uint16_t step = histStep(ch);
-  int px = -1, py = -1;
-  int32_t prevIdx = -1;
-  bool prevJoined = false;
-  for (uint16_t i = 0; i < histCount; i++) {
-    float v = storeToVal(q, histAt(ch, i));
-    if (isnan(v)) continue;
-    int x = xFor(i), y = yFor(v);
+  for (uint8_t s = 0; s < p.n; s++) {
+    const uint8_t ch    = p.first + s;
+    const uint8_t style = channels[ch].style;
+    const uint16_t step = histStep(ch);
+    int px = -1, py = -1;
+    int32_t prevIdx = -1;
+    bool prevJoined = false;
+    float phase = 0;                  // faze vzoru, spojita pres celou krivku
+    for (uint16_t i = 0; i < histCount; i++) {
+      float v = storeToVal(channels[ch].q, histAt(ch, i));
+      if (isnan(v)) continue;
+      int x = xFor(i), y = yFor(s, v);
 
-    bool joined = (prevIdx >= 0 && ((int32_t)i - prevIdx) <= (int32_t)step);
-    if (joined) {
-      if (channels[ch].dashed) {
-        drawDashedLine(px, py, x, y, 5, 4);
-      } else {
-        display.drawLine(px, py, x, y, GxEPD_BLACK);
-        display.drawLine(px, py - 1, x, y - 1, GxEPD_BLACK);   // tloustka 2 px
+      bool joined = (prevIdx >= 0 && ((int32_t)i - prevIdx) <= (int32_t)step);
+      if (joined) {
+        if (style == CH_DASHED)      drawDashedLine(px, py, x, y, 6, 5, phase);
+        else if (style == CH_DOTTED) drawDashedLine(px, py, x, y, 2, 4, phase);
+        else {
+          display.drawLine(px, py, x, y, GxEPD_BLACK);
+          display.drawLine(px, py - 1, x, y - 1, GxEPD_BLACK);   // tloustka 2 px
+        }
+      } else if (prevIdx >= 0 && !prevJoined) {
+        display.fillCircle(px, py, 2, GxEPD_BLACK);   // predchozi zustal sam
       }
-    } else if (prevIdx >= 0 && !prevJoined) {
-      display.fillCircle(px, py, 2, GxEPD_BLACK);   // predchozi zustal sam
+      px = x; py = y; prevIdx = (int32_t)i; prevJoined = joined;
     }
-    px = x; py = y; prevIdx = (int32_t)i; prevJoined = joined;
+    // Posledni vzorek uz nema naslednika, ktery by ho vykreslil.
+    if (prevIdx >= 0 && !prevJoined) display.fillCircle(px, py, 2, GxEPD_BLACK);
   }
-  // Posledni vzorek uz nema naslednika, ktery by ho vykreslil.
-  if (prevIdx >= 0 && !prevJoined) display.fillCircle(px, py, 2, GxEPD_BLACK);
+
+  // --- serie bez jedineho vzorku ---
+  // Typicky hned po smazani historie v servisu nebo hotspotu: prvni vzorek
+  // z cidel na desce se zamerne neuklada (ohrata deska, viz setup()), nebo
+  // SEN6x pri senmult > 1 v tomto cyklu nebezel. Prazdny ram by vypadal jako
+  // porucha, proto napiseme, ze data prijdou.
+  if (histCount > 0) {
+    useFont(&FreeSans9pt7b);
+    char msg[MAX_PER_PLOT][48];
+    uint8_t nm = 0;
+    for (uint8_t s = 0; s < p.n; s++) {
+      if (sAny[s]) continue;
+      if (p.n == 1) snprintf(msg[nm++], sizeof(msg[0]), "ceka na dalsi mereni");
+      else snprintf(msg[nm++], sizeof(msg[0]), "%s: ceka na dalsi mereni",
+                    qShort(channels[p.first + s].q));
+    }
+    if (nm) {
+      int16_t x1, y1; uint16_t w, h;
+      display.getTextBounds("Ag", 0, 0, &x1, &y1, &w, &h);
+      const int lineH = (int)h + 6;
+      int ty = plotTop + (plotH - nm * lineH) / 2 + (int)h;
+      for (uint8_t i = 0; i < nm; i++, ty += lineH) {
+        display.getTextBounds(msg[i], 0, 0, &x1, &y1, &w, &h);
+        int tx = gx + (gw - (int)w) / 2;
+        if (tx < gx + 6) tx = gx + 6;
+        display.fillRect(tx - 3, ty - (int)h - 2, w + 6, h + 6, GxEPD_WHITE);
+        display.setCursor(tx, ty);
+        display.print(msg[i]);
+      }
+    }
+  }
 }
 
 // Zapati s verzi firmwaru. Drzi se uplne dole, aby si nekonkurovalo
@@ -2718,25 +3631,169 @@ void drawFooter() {
   drawRight(fwBuildDate(), W - 15, H - 8);
 }
 
+// Nápoveda, jak se dostat do nastaveni. Sedi nad zapatim, tedy uplne dole
+// a mimo grafy. Bez ni se uzivatel bez README a bez USB do konfigurace
+// nedostane - hlaska "PUSH: pust mezi 2-5 s" jde dnes jen na seriovou linku,
+// kterou u desky bezici na baterii nikdo nevidi.
+//
+// Mazani historie (DOWN 5 s) se sem VEDOME nepise. Je to nevratna akce
+// a vytistena na displeji, ktery ma clovek porad pred sebou, je spis
+// pozvanka k nehode nez napoveda. Zustava v README a v prikazu 'help'.
+//
+// Fonty Adafruit GFX pokryvaji jen ASCII 0x20-0x7E, takze bez diakritiky.
+#define HINT_Y      (H - 26)        // uctara radku s napovedou
+#define HINT_TEXT   "Pri restartu drz PUSH: 2 s = servis (USB), 5 s = WiFi"
+
+void drawHint() {
+  useFont(&FreeSans9pt7b);
+  // Po kalibraci CO2 se tu na nekolik prekresleni (CAL_SHOW_RENDERS) ukaze
+  // jeji vysledek. Kalibrace bezi az po zavreni servisu nebo hotspotu, takze
+  // clovek, ktery ji spustil z telefonu a odesel, by se ho jinak nedozvedel.
+  if (calShowLeft > 0 && calLast.magic == CAL_MAGIC) {
+    char buf[72];
+    calText(buf, sizeof(buf));
+    richPrint(20, HINT_Y, buf);
+    return;
+  }
+  richPrint(20, HINT_Y, HINT_TEXT);
+}
+
 void drawGraphs(int top) {
-  // Spodni okraj je nad zapatim s verzi (popisky casove osy sedi 16 px
-  // pod ramem grafu, takze grafy musi skoncit driv).
-  const int bottom = H - 46, left = 55, right = W - 15;
+  // Spodni okraj je nad radkem s napovedou a zapatim (popisky casove osy sedi
+  // 16 px pod ramem grafu, takze grafy musi skoncit driv). Radek napovedy si
+  // vzal 16 px; pri ctyrech grafech to dela 4 px z kazdeho.
+  const int bottom = H - 62, left = 55;
+
+  // Pruh pro druhou osu se rezervuje VSEM panelum, jakmile ho potrebuje aspon
+  // jeden - ruzne siroke ramy pod sebou vypadaji jako chyba vykresleni.
+  bool needRight = false;
+  for (uint8_t i = 0; i < plotCount; i++) if (plotDualAxis(i)) needRight = true;
+  const int right = W - 15 - (needRight ? RIGHT_AXIS_W : 0);
   const int gw = right - left;
-  int n = channelCount > 0 ? channelCount : 1;
+
+  int n = plotCount > 0 ? plotCount : 1;
 
   // Mezera mezi grafy musi pojmout popisky casove osy (uctara gBottom+16,
   // podpatek jeste 3 px pod ni) a nadpis dalsiho grafu (uctara gy-8, horni
-  // dotah 13 px nad ni). Minimum je tedy 19 + 21 = 40 px; 42 nechava rezervu
-  // a i pri ctyrech grafech zbyde na kazdy 78 px vysky.
+  // dotah 13 px nad ni). Minimum je tedy 19 + 21 = 40 px; 42 nechava rezervu.
   const int gap = 42;
   int gh = (bottom - top - gap * n) / n;
   if (gh < 40) gh = 40;
   int y = top + 26;          // odstup od delici cary nad prvnim nadpisem
-  for (uint8_t c = 0; c < channelCount; c++) {
-    drawOneGraph(c, left, y, gw, gh);
+  for (uint8_t i = 0; i < plotCount; i++) {
+    drawPlot(i, left, y, gw, gh);
     y += gh + gap;
   }
+}
+
+// Obrazovka po dobu kalibrace CO2. Kalibrace trva i nekolik minut (az se
+// hodnoty ustali), takze bez ni by displej celou dobu ukazoval stary stav
+// a clovek by nevedel, jestli se vubec neco deje. Jen ASCII (fonty GFX).
+//
+// Nejdriv se kresli cela (renderCalScreen), pak kazdych CAL_DRAW_MS jen
+// oblast se stavem (calProgress) castecnym prekreslenim. Mezi tim se displej
+// jen vypina (powerOff), NEuspava (hibernate) - po hibernate by radic ztratil
+// obsah pameti a castecne prekresleni by nemelo z ceho vychazet.
+#define CALS_Y  288                // oblast se stavem: zacatek ...
+#define CALS_H  192                // ... a vyska (nasobky 8 kvuli radici)
+bool calDisplayOn = false;         // nastavi calScreenIfPending()
+
+static void fmtMinSec(char *o, size_t n, uint32_t s) {
+  snprintf(o, n, "%lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
+}
+
+// Oblast se stavem - spolecna pro celou obrazovku i castecne prekresleni.
+static void drawCalStatus(const CalView &v) {
+  char buf[64], t[12];
+
+  useFont(&FreeSans9pt7b);
+  richPrint(20, CALS_Y + 26, "Stav");
+  useFont(&FreeSansBold18pt7b);
+  richPrint(20, CALS_Y + 60, v.phase == CALV_DELAY  ? "Odneste desku" :
+                             v.phase == CALV_STABLE ? "Ustaleno" : "Ustaluje se");
+
+  useFont(&FreeSans9pt7b);
+  richPrint(20, CALS_Y + 104, "Aktualne");
+  if (isnan(v.co2)) snprintf(buf, sizeof(buf), "-- ppm");
+  else if (isnan(v.tc)) snprintf(buf, sizeof(buf), "%.0f ppm", v.co2);
+  else snprintf(buf, sizeof(buf), "%.0f ppm   %.1f " U_DEGC, v.co2, v.tc);
+  useFont(&FreeSansBold18pt7b);
+  richPrint(20, CALS_Y + 138, buf);
+
+  useFont(&FreeSans9pt7b);
+  fmtMinSec(t, sizeof(t), v.secs);
+  if (v.phase == CALV_DELAY)
+    snprintf(buf, sizeof(buf), "Mereni zacne za %s", t);
+  else if (v.phase == CALV_STABLE)
+    snprintf(buf, sizeof(buf), "Hodnoty jsou stabilni, kalibruji...");
+  else if (isnan(v.slope))
+    snprintf(buf, sizeof(buf), "Meri se %s", t);
+  else
+    snprintf(buf, sizeof(buf), "Meri se %s, zmena %+.0f ppm/min (cil pod %.0f)",
+             t, v.slope, CAL_SLOPE_CO2);
+  richPrint(20, CALS_Y + 172, buf);
+}
+
+void renderCalScreen(const CalView &v) {
+  display.setRotation(3);
+  display.setTextColor(GxEPD_BLACK);
+  display.setTextWrap(false);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    char buf[48];
+
+    useFont(&FreeSansBold18pt7b);
+    richPrint(20, 56, "Prave probiha");
+    richPrint(20, 98, "kalibrace CO2");
+    display.drawFastHLine(20, 120, W - 40, GxEPD_BLACK);
+
+    useFont(&FreeSans9pt7b);
+    richPrint(20, 158, "Cidlo");
+    useFont(&FreeSansBold18pt7b);
+    richPrint(20, 192, v.sensor);
+
+    useFont(&FreeSans9pt7b);
+    richPrint(20, 236, "Reference");
+    snprintf(buf, sizeof(buf), "%d ppm", (int)v.target);
+    useFont(&FreeSansBold18pt7b);
+    richPrint(20, 270, buf);
+
+    drawCalStatus(v);
+    display.drawFastHLine(20, CALS_Y + CALS_H + 2, W - 40, GxEPD_BLACK);
+
+    useFont(&FreeSans9pt7b);
+    static const char *const TXT[] = {
+      "Odneste desku na misto mereni a drzte ji",
+      "dal od obliceje - dech ma desitky tisic ppm.",
+      "Venku ve stinu, mimo vyfuky, je vzduch",
+      "kolem 420 ppm.",
+      "",
+      "Kalibrace probehne, az se hodnoty ustali,",
+      "obvykle za 5 az 15 minut. Vysledek se pak",
+      "ukaze dole na displeji.",
+    };
+    int y = CALS_Y + CALS_H + 36;
+    for (uint8_t i = 0; i < sizeof(TXT) / sizeof(TXT[0]); i++) {
+      if (TXT[i][0]) richPrint(20, y, TXT[i]);
+      y += 24;
+    }
+    drawFooter();
+  } while (display.nextPage());
+}
+
+// Prubeh kalibrace - vola calRun() kazdych CAL_DRAW_MS.
+void calProgress(const CalView &v) {
+  if (!calDisplayOn) return;
+  display.setRotation(3);
+  display.setPartialWindow(0, CALS_Y, W, CALS_H);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    drawCalStatus(v);
+  } while (display.nextPage());
+  display.powerOff();
 }
 
 void render(const Reading &r, float vb) {
@@ -2751,6 +3808,7 @@ void render(const Reading &r, float vb) {
     display.fillScreen(GxEPD_WHITE);
     drawHeader(r, vb);
     drawGraphs(headerBottom(r));
+    drawHint();
     drawFooter();
   } while (display.nextPage());
 }
@@ -2801,9 +3859,11 @@ void svcHelp() {
                   senName[0] ? senName : "?", senSerial[0] ? senSerial : "?");
   Serial.print  ("Kanaly grafu:     ");
   for (uint8_t c = 0; c < channelCount; c++) {
-    Serial.printf("%s%s", qKey(channels[c].q), (c + 1 < channelCount) ? ", " : "");
+    Serial.printf("%s%s", (c && channels[c].join) ? " + " : (c ? ", " : ""),
+                  qKey(channels[c].q));
   }
-  Serial.printf(" (%s)\n", cfg.chAuto ? "auto" : "rucne");
+  Serial.printf(" (%s, %u graf%s)\n", cfg.chAuto ? "auto" : "rucne",
+                plotCount, plotCount == 1 ? "" : "y");
   svcAvailable();
   Serial.printf("Interval mereni:  %d min\n", cfg.intervalMin);
   Serial.printf("Kapacita:         %u vzorku/kanal = %.1f h\n",
@@ -2838,7 +3898,12 @@ void svcHelp() {
   if (det.scd41 || senHasCo2()) {
     Serial.println();
     Serial.printf ("  CO2 (%s)\n", det.scd41 ? "SCD41" : senKindName(senKind));
-    Serial.println("  co2ref=<x>  Kalibrace na hodnotu [ppm] (venku ~420, 3+ min)");
+    Serial.println("  co2ref=<x>  Kalibrace na hodnotu [ppm] (venku ~420). Zacne po exit");
+    Serial.printf ("              a odkladu %d s (co2ref=420,120 = odklad 120 s), probehne,\n",
+                   CAL_DELAY_DEF);
+    Serial.println("              az se hodnoty ustali.");
+    Serial.println("  co2reset    SCD41: obnovit tovarni kalibraci (smaze vsechny predchozi");
+    Serial.println("              kalibrace i historii samokalibrace)");
     Serial.println("  asc=0|1     Automaticka samokalibrace");
   }
   if (det.sen6x) {
@@ -2867,6 +3932,13 @@ void svcHelp() {
   Serial.printf ("  ch=a,b,c    Rucni vyber az %d velicin, napr.\n", MAX_CHANNELS);
   Serial.println("              ch=co2,pm25,temp.sht,temp.sen");
   Serial.println("              (velicina konkretniho cidla ma tecku - viz seznam vyse)");
+  Serial.printf ("  ch=a+b,c    Plus = do jednoho grafu (nejvys %d krivky,\n", MAX_PER_PLOT);
+  Serial.printf ("              pri ruznych jednotkach %d a druha osa Y), napr.\n",
+                 MAX_PER_PLOT_MIX);
+  Serial.println("              ch=temp.sht+temp.sen,co2");
+  Serial.println("              Pozor: neslucujte veliciny s hodne odlisnym rozsahem");
+  Serial.println("              (pokojova + venkovni teplota v zime) - osa se roztahne");
+  Serial.println("              a z prubehu nebude videt nic. Delku historie to nemeni.");
   Serial.println();
   Serial.println("  SPRAVA");
   Serial.println("  list        Vypise aktualni nastaveni");
@@ -2926,6 +3998,12 @@ void svcList() {
     if (cfg.scdAsc)
       Serial.println("  POZOR: samokalibrace pri uspavani cidla nefunguje"
                      " (datasheet). Doporuceno asc=0 + obcas co2ref=420.");
+    char cb[72];
+    calText(cb, sizeof(cb));
+    Serial.printf("  posledni: %s\n", cb);
+    if (calWarnText()[0]) Serial.printf("            %s\n", calWarnText());
+    if (pendingCo2Ref >= 0)
+      Serial.printf("  ceka:     co2ref=%d, probehne po exit\n", (int)pendingCo2Ref);
   }
   if (det.sen6x) {
     Serial.printf("  cidlo    = %s  sn %s\n",
@@ -2947,10 +4025,24 @@ void svcList() {
   Serial.printf("  zdroje: teplota=%s vlhkost=%s co2=%s tlak=%s\n",
                 srcTempName(), srcHumName(), srcCo2Name(), srcPressName());
   svcAvailable();
+  // POZOR, tenhle radek parsuje webovy konfigurator regexem
+  //   ^\s*ch\s*=\s*([a-z0-9.,]+)\s*\((auto|rucne)\)
+  // Tvar se proto NESMI menit: jen carky, zadne plus, a v zavorce jen auto
+  // nebo rucne. Konfigurator a firmware se nasazuji nezavisle, takze nova
+  // verze firmwaru musi fungovat i se starym konfiguratorem - jinak prestane
+  // prebirat vyber kanalu z desky a pri "Pouzit" posle jiny vyber (a deska
+  // zalozi novou historii). Slouceni grafu je proto na samostatnem radku.
   Serial.print ("  ch   = ");
   for (uint8_t c = 0; c < channelCount; c++)
-    Serial.printf("%s%s", qKey(channels[c].q), (c + 1 < channelCount) ? "," : "");
+    Serial.printf("%s%s", c ? "," : "", qKey(channels[c].q));
   Serial.printf(" (%s)\n", cfg.chAuto ? "auto" : "rucne");
+  if (plotCount != channelCount) {
+    Serial.print ("  grafy = ");
+    for (uint8_t c = 0; c < channelCount; c++)
+      Serial.printf("%s%s", (c && channels[c].join) ? "+" : (c ? "," : ""),
+                    qKey(channels[c].q));
+    Serial.printf(" (%u graf%s)\n", plotCount, plotCount == 1 ? "" : "y");
+  }
   Serial.printf("  historie: %u vzorku z %u (%.1f h z %.1f h)\n",
                 histCount, histPerCh, histSpanMin() / 60.0f,
                 histPerCh * cfg.intervalMin / 60.0f);
@@ -2981,6 +4073,97 @@ void svcDump() {
   Serial.println("#END");
 }
 
+// Rozebere vyber kanalu "a+b,c": carka oddeluje grafy, plus slucuje veliciny
+// do jednoho grafu. Spolecne pro servis i hotspot, aby obe cesty prijimaly
+// presne totez. Pri chybe vrati false a v err je duvod.
+bool chParse(String v, Quantity sel[], bool joi[], uint8_t &n, bool &overflow, String &err) {
+  char e[96];
+  v.toLowerCase(); v.trim();
+  for (uint8_t i = 0; i < MAX_CHANNELS; i++) { sel[i] = Q_NONE; joi[i] = false; }
+  n = 0;
+  uint8_t inPlot = 0;              // kolik seri uz ma rozdelany panel
+  uint8_t plotStart = 0;           // index prvni serie rozdelaneho panelu
+  int start = 0;
+  overflow = false;
+
+  while (start <= (int)v.length()) {
+    // Nejblizsi oddelovac je bud carka (novy panel), nebo plus (tataz).
+    int comma = v.indexOf(',', start);
+    int plus  = v.indexOf('+', start);
+    int cut   = -1; bool join = false;
+    if (comma < 0)      { cut = plus;  join = (plus >= 0); }
+    else if (plus < 0)  { cut = comma; join = false; }
+    else if (plus < comma) { cut = plus;  join = true; }
+    else                { cut = comma; join = false; }
+
+    String part = (cut < 0) ? v.substring(start) : v.substring(start, cut);
+    part.trim();
+    if (part.length()) {
+      if (n >= MAX_CHANNELS) { overflow = true; break; }
+      Quantity q = qFromKey(part);
+      if (q == Q_NONE) { snprintf(e, sizeof(e), "Neznama velicina: %s", part.c_str()); err = e; return false; }
+      if (!qAvailable(q)) {
+        snprintf(e, sizeof(e), "Velicina %s neni dostupna - chybi cidlo.", part.c_str());
+        err = e; return false;
+      }
+      // Velicina, na kterou zrovna ukazuje temp/hum, se nenabizi - jinak by
+      // se do kanalu dostalo neco, co konfigurator nezna a pri prvnim
+      // "Pouzit" by to tise vypadlo.
+      if (!qOffered(q)) {
+        const char *alias = (qCanonical(Q_TEMP) == q) ? qKey(Q_TEMP) : qKey(Q_HUM);
+        snprintf(e, sizeof(e), "%s je ted totez co '%s' - pouzij '%s'.",
+                 part.c_str(), alias, alias);
+        err = e; return false;
+      }
+      // Duplicita muze byt i skryta: "temp" je pri tsrc=sen tataz vec jako
+      // "temp.sen", jen pod jinym jmenem.
+      for (uint8_t i = 0; i < n; i++)
+        if (qCanonical(sel[i]) == qCanonical(q)) {
+          snprintf(e, sizeof(e), "%s je tataz velicina jako %s - staci jednou.",
+                   part.c_str(), qKey(sel[i]));
+          err = e; return false;
+        }
+
+      bool cont = (inPlot > 0);          // pokracujeme v rozdelanem panelu?
+      if (cont) {
+        // Kolik krivek panel unese, zavisi na tom, jestli maji spolecnou osu.
+        // Pri ruznych jednotkach jsou to dve (dve osy Y), jinak tri.
+        bool mixed = false;
+        for (uint8_t i = plotStart; i < n; i++)
+          if (qAxisClass(sel[i]) != qAxisClass(q)) mixed = true;
+        uint8_t lim = mixed ? MAX_PER_PLOT_MIX : MAX_PER_PLOT;
+        if (inPlot >= lim) {
+          snprintf(e, sizeof(e), "V jednom grafu je nejvys %u krivky%s - %s dej zvlast.",
+                   lim, mixed ? " (pri ruznych jednotkach, kvuli druhe ose)" : "",
+                   part.c_str());
+          err = e; return false;
+        }
+      }
+
+      sel[n] = q; joi[n] = cont;
+      if (!cont) { plotStart = n; inPlot = 1; } else inPlot++;
+      n++;
+    }
+    // Carka ukoncuje panel VZDY, i kdyz byl dil pred ni prazdny. Bez toho by
+    // se "co2+,temp" slouclo pres carku, protoze priznak od plusu by prezil
+    // preskoceny prazdny dil.
+    if (!join) inPlot = 0;
+    if (cut < 0) break;
+    start = cut + 1;
+  }
+
+  if (n == 0) { err = "Zadny platny kanal."; return false; }
+  return true;
+}
+
+// Ulozi rozebrany vyber do konfigurace.
+void chStore(const Quantity sel[], const bool joi[], uint8_t n) {
+  cfg.chAuto = 0;
+  for (uint8_t i = 0; i < MAX_CHANNELS; i++)
+    cfg.chSel[i] = (i < n) ? (uint8_t)(sel[i] | (joi[i] ? CH_JOIN_BIT : 0)) : Q_NONE;
+  cfg.chSel[0] &= CH_Q_MASK;       // prvni nema s cim slucovat
+}
+
 // Zpracuje prikaz ch=...
 void svcSetChannels(String v, bool &dirty) {
   v.toLowerCase(); v.trim();
@@ -2995,53 +4178,40 @@ void svcSetChannels(String v, bool &dirty) {
     Serial.println();
     return;
   }
+  // Carka oddeluje PANELY, plus SERIE v jednom panelu:
+  //   ch=temp.sht+temp.sen,co2      dva panely, prvni ma dve krivky
+  // Slucuje se tedy jen na vyslovne prani. Automaticky to delat nelze:
+  // dve pokojova cidla ve spolecnem grafu davaji smysl, pokojova a venkovni
+  // teplota v zime ne - spolecna osa by se roztahla pres 35 °C a z denniho
+  // prubehu by nebylo videt nic.
   Quantity sel[MAX_CHANNELS];
-  for (uint8_t i = 0; i < MAX_CHANNELS; i++) sel[i] = Q_NONE;
-  uint8_t n = 0;
-  int start = 0;
-  while (start <= (int)v.length() && n < MAX_CHANNELS) {
-    int comma = v.indexOf(',', start);
-    String part = (comma < 0) ? v.substring(start) : v.substring(start, comma);
-    part.trim();
-    if (part.length()) {
-      Quantity q = qFromKey(part);
-      if (q == Q_NONE) { Serial.printf("Neznama velicina: %s\n", part.c_str()); return; }
-      if (!qAvailable(q)) {
-        Serial.printf("Velicina %s neni dostupna - chybi cidlo.\n", part.c_str());
-        return;
-      }
-      // Velicina, na kterou zrovna ukazuje temp/hum, se nenabizi - jinak by
-      // se do kanalu dostalo neco, co konfigurator nezna a pri prvnim
-      // "Pouzit" by to tise vypadlo.
-      if (!qOffered(q)) {
-        const char *alias = (qCanonical(Q_TEMP) == q) ? qKey(Q_TEMP) : qKey(Q_HUM);
-        Serial.printf("%s je ted totez co '%s' - pouzij '%s'.\n",
-                      part.c_str(), alias, alias);
-        return;
-      }
-      // Duplicita muze byt i skryta: "temp" je pri tsrc=sen tataz vec jako
-      // "temp.sen", jen pod jinym jmenem.
-      for (uint8_t i = 0; i < n; i++)
-        if (qCanonical(sel[i]) == qCanonical(q)) {
-          Serial.printf("%s je tataz velicina jako %s - staci jednou.\n",
-                        part.c_str(), qKey(sel[i]));
-          return;
-        }
-      sel[n++] = q;
-    }
-    if (comma < 0) break;
-    start = comma + 1;
-  }
-  if (n == 0) { Serial.println("Zadny platny kanal."); return; }
-  if (n >= MAX_CHANNELS && v.indexOf(',', start) >= 0)
+  bool     joi[MAX_CHANNELS];
+  uint8_t  n = 0;
+  bool     overflow = false;
+  String   err;
+  if (!chParse(v, sel, joi, n, overflow, err)) { Serial.println(err); return; }
+
+  if (overflow)
     Serial.printf("POZOR: do grafu jde nejvyse %d velicin, zbytek se ignoruje.\n",
                   MAX_CHANNELS);
-  cfg.chAuto = 0;
-  for (uint8_t i = 0; i < MAX_CHANNELS; i++) cfg.chSel[i] = (i < n) ? sel[i] : Q_NONE;
+
+  chStore(sel, joi, n);
   dirty = true;
   relayoutHistory(false);
-  Serial.printf("ch nastaveno (%u kanalu), kapacita %u vzorku = %.1f h\n",
-                channelCount, histPerCh, histPerCh * cfg.intervalMin / 60.0f);
+
+  Serial.printf("ch nastaveno (%u velicin v %u grafech), kapacita %u vzorku = %.1f h\n",
+                channelCount, plotCount, histPerCh,
+                histPerCh * cfg.intervalMin / 60.0f);
+  // Slucovani nezkracuje ani neprodluzuje historii - delka se ridi poctem
+  // kanalu, ne poctem grafu. Rikame to nahlas, protoze tabulka v README
+  // mluvi o kanalech a je snadne si to splest.
+  for (uint8_t i = 0; i < plotCount; i++) {
+    if (plots[i].n < 2) continue;
+    Serial.printf("  graf %u: ", i + 1);
+    for (uint8_t s = 0; s < plots[i].n; s++)
+      Serial.printf("%s%s", s ? " + " : "", qKey(channels[plots[i].first + s].q));
+    Serial.printf("  (%s)\n", plotDualAxis(i) ? "dve osy Y" : "spolecna osa Y");
+  }
 }
 
 void svcSetInterval(int v, bool &dirty) {
@@ -3095,6 +4265,13 @@ bool svcHandle(String line, bool &dirty) {
   }
   if (low == "save")  { cfgSave(); dirty = false; Serial.println("Ulozeno do NVS."); return false; }
   if (low == "clear") { histClear(); histEraseNVS(); Serial.println("Historie smazana."); return false; }
+  if (low == "co2reset") {
+    if (!det.scd41) { Serial.println("Tovarni kalibraci umi obnovit jen SCD41. Nezmeneno."); return false; }
+    if (scd41FactoryReset())
+      Serial.println("SCD41 ma zpet tovarni kalibraci. Pro presnost ho pak zkalibrujte"
+                     " venku (co2ref=420).");
+    return false;
+  }
   if (low == "exit")  {
     if (dirty) { cfgSave(); Serial.println("Ulozeno."); }
     Serial.println("Ukoncuji servis.");
@@ -3165,12 +4342,27 @@ bool svcHandle(String line, bool &dirty) {
         Serial.println("V sestave neni zadne cidlo CO2. Nezmeneno.");
         return false;
       }
-      int c = val.toInt();
+      // co2ref=<ppm>[,<odklad s>]   napr. co2ref=420, co2ref=420,120
+      // Starsi firmware z toho precte jen cislo na zacatku (toInt), takze
+      // novy tvar prikazu mu neublizi. Vykricnik na konci (driv "vynutit")
+      // se tise prijme a nic nedela - velka korekce se uz neblokuje.
+      String v = val; v.trim();
+      if (v.endsWith("!")) v.remove(v.length() - 1);
+      int comma = v.indexOf(',');
+      int c = v.toInt();
+      int d = (comma >= 0) ? v.substring(comma + 1).toInt() : CAL_DELAY_DEF;
       if (c < 300 || c > 2000) { Serial.println("Rozsah 300 az 2000 ppm. Nezmeneno."); return false; }
-      pendingCo2Ref = (int16_t)c;
-      Serial.printf("co2ref=%d (provede se pri dalsim mereni)\n", c);
-      if (det.sen6x && !det.scd41)
-        Serial.println("Cidlo kvuli tomu jednorazove pobezi 3,5 minuty.");
+      if (d < 0 || d > CAL_DELAY_MAX) {
+        Serial.printf("Odklad 0 az %d s. Nezmeneno.\n", CAL_DELAY_MAX); return false;
+      }
+      pendingCo2Ref    = (int16_t)c;
+      pendingCalDelayS = (uint16_t)d;
+      Serial.printf("co2ref=%d - kalibrace %s zacne po ukonceni servisu"
+                    " (exit nebo %d s necinnosti) a odkladu %d s.\n",
+                    c, calSensorName(), SERVICE_TIMEOUT_MS / 1000, d);
+      Serial.printf("Pak cidlo meri, dokud se hodnoty neustali (nejmene %lu, nejvys %lu min)."
+                    " Prubeh i vysledek budou na displeji.\n",
+                    (unsigned long)(CAL_MIN_MS / 60000UL), (unsigned long)(CAL_MAX_MS / 60000UL));
     } else if (key == "senwarm") {
       int s = val.toInt();
       if (s < SEN_WARM_LO || s > SEN_WARM_HI) {
@@ -3400,6 +4592,7 @@ button.dg{border-color:var(--er);color:var(--er)}
 .cl div{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--bd);font-size:13px}
 .cl div:last-child{border:0}.cl b{font-family:ui-monospace,monospace}
 .wn{color:var(--ac);font-size:13px;margin:8px 0 0}
+.q select{font:inherit;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--bs);background:var(--in);color:inherit}
 .n{font-size:13px;color:var(--dm);margin:10px 0 0}
 .t{position:fixed;left:0;right:0;bottom:0;background:var(--ok);color:#06130d;
 text-align:center;padding:12px;font-weight:700;transform:translateY(100%);transition:.25s}
@@ -3441,11 +4634,20 @@ min-height:34px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 <p class="wn hd" id="ascwn"></p>
 <div class="r"><label>Kalibrovat na hodnotu [ppm]</label>
 <input type=number id=co2ref step=5 min=300 max=2000 value=420></div>
+<div class="r"><label>Odklad startu [s] - čas odnést desku</label>
+<input type=number id=caldelay step=10 min=0 max=600 value=90></div>
 <div class="acts"><button class="pr" onclick="applyCo2(this)">Použít</button>
 <button onclick="calCo2(this)">Kalibrovat</button></div>
-<p class="n">Kalibrace se provede při dalším měření. Nechte desku aspoň
-3 minuty v ustáleném prostředí - venku na čerstvém vzduchu odpovídá 420 ppm.
-Kalibrace přežije odpojení napájení, takže stačí jednou za čas.</p>
+<p class="n">Kalibrace začne po vypnutí hotspotu (tlačítko dole na stránce)
+a uplynutí odkladu - za tu dobu desku odneste na místo měření a držte ji dál
+od obličeje. Čidlo pak měří, dokud se hodnoty neustálí (obvykle 5 až 15 minut),
+a teprve potom se kalibruje. Průběh i výsledek uvidíte na displeji. Venku ve
+stínu na čerstvém vzduchu odpovídá 420 ppm. Kalibrace přežije odpojení
+napájení, takže stačí jednou za čas.</p>
+<p class="n" id="calst"></p>
+<div class="acts hd" id="rReset"><button class="dg" onclick="resetCo2(this)">Obnovit tovární kalibraci</button></div>
+<p class="n hd" id="resetH">Smaže všechny dosavadní kalibrace SCD41 a vrátí výrobní. Hodí
+se, když se kalibrace pokazila: čidlo pak hned ukáže, co měří bez nich.</p>
 </div></div>
 
 <div class="p hd" id="pSen"><h2>Čidlo prachu SEN6x</h2><div class="b">
@@ -3503,10 +4705,12 @@ už by neplatily.</p>
 
 <div class="p"><h2>Veličiny v grafu</h2><div class="b">
 <p class="n" style="margin:0 0 10px">Kromě hlavní teploty a vlhkosti jde do grafu
-dát i každé čidlo zvlášť - třeba teplotu ze SHT40 a ze SEN63C vedle sebe.</p>
+dát i každé čidlo zvlášť - třeba teplotu ze SHT40 a ze SEN63C vedle sebe.
+Veličiny se stejným číslem grafu se nakreslí do jednoho grafu.</p>
 <div class="r"><label>Vybrat automaticky</label>
 <input type=checkbox id=auto onchange="qUpd()" style="width:20px;height:20px;accent-color:var(--ac)"></div>
 <div class="q" id="qg" style="margin-top:10px"></div>
+<p class="n hd" id="chp"></p><p class="wn hd" id="chw"></p>
 <div class="acts"><button onclick="applyCh(this)">Použít veličiny</button></div>
 </div></div>
 
@@ -3532,7 +4736,7 @@ dát i každé čidlo zvlášť - třeba teplotu ze SHT40 a ze SEN63C vedle sebe
 </div><div class="t" id="tst"></div>
 <script>
 // Q se sklada z JSON ("quants") - stranka nemusi o cidlech nic vedet dopredu.
-var S={},Q=[],TS="auto",HS="auto";
+var S={},Q=[],TS="auto",HS="auto",GR={},ORD=[];
 var POOL=2592,CAP=2016;
 function toast(m,e){var t=document.getElementById("tst");t.textContent=m;
 t.className="t on"+(e?" er":"");setTimeout(function(){t.className="t"+(e?" er":"")},2200)}
@@ -3543,7 +4747,8 @@ function req(u,b,l,cb){fetch(u).then(function(r){
 if(!r.ok)throw new Error("http "+r.status);return r.json()}).then(function(j){
 if(!j||j.error)throw new Error(j&&j.error||"err");
 S=j;draw();if(b)ok(b,l||"Hotovo ✓");if(cb)cb(j)})
-.catch(function(e){toast(String(e).indexOf("http 500")>0?"Uložení selhalo!":"Chyba spojení",1)})}
+.catch(function(e){var m=e&&e.message||String(e);
+toast(m.indexOf("http 500")>=0?"Uložení selhalo!":(/^(http|err$)|fetch|network/i.test(m)?"Chyba spojení":m),1)})}
 // Deska uklada nejvyse MAX_CHANNELS veliciny. Kdyby se tady pocitalo s vic,
 // ukazovala by stranka delku historie, ktera nikdy nenastane - firmware
 // v /api/set stejne prebere jen prvnich MAXCH.
@@ -3578,7 +4783,9 @@ function qGrid(){var nq=S.quants||[];
 var same=nq.length===Q.length&&nq.every(function(o,i){return Q[i]&&Q[i].k===o.k&&Q[i].n===o.n});
 Q=nq;if(same)return;
 var h="";Q.forEach(function(x){
-h+='<label><input type=checkbox id="q_'+x.k+'" onchange="qPick(this)">'+x.n+"</label>"});
+h+='<label><input type=checkbox id="q_'+x.k+'" onchange="qPick(this)">'+x.n
++' <select id="g_'+x.k+'" class="hd" onchange="GR[\''+x.k+'\']=+this.value;plan()">'
++'<option value=1>graf 1<option value=2>graf 2<option value=3>graf 3<option value=4>graf 4</select></label>'});
 g("qg").innerHTML=h||"<span>Zatím nic k měření</span>"}
 // Tlacitka pro volbu hlavniho zdroje teploty a vlhkosti.
 function srcBtns(){
@@ -3594,10 +4801,13 @@ function setSrc(which,k){if(which==="TS")TS=k;else HS=k;srcBtns()}
 function applySrc(b){
 if(!confirm("Změna zdroje založí novou historii. Pokračovat?"))return;
 req("/api/set?tsrc="+TS+"&hsrc="+HS,b,"Použito ✓")}
+function resetCo2(b){if(!confirm("Smazat všechny dosavadní kalibrace SCD41 a vrátit tovární?"))return;
+req("/api/co2reset",b,"Obnoveno ✓")}
 function applyCo2(b){req("/api/set?asc="+(g("asc").checked?1:0),b,"Použito ✓")}
-function calCo2(b){var v=+g("co2ref").value||420;
+function calCo2(b){var v=+g("co2ref").value||420,d=+g("caldelay").value;
 if(v<300||v>2000){toast("Rozsah 300 až 2000 ppm",1);return}
-req("/api/set?co2ref="+v,b,"Naplánováno ✓")}
+if(isNaN(d)||d<0||d>600){toast("Odklad 0 až 600 s",1);return}
+req("/api/set?co2ref="+v+"&caldelay="+Math.round(d),b,"Naplánováno ✓")}
 function applySen(b){req("/api/set?senwarm="+(+g("senwarm").value||30)
 +"&senmult="+SM+"&senauto="+(+g("senauto").value||0)
 +"&lsleep="+(g("lsleep").checked?1:0),b,"Použito ✓")}
@@ -3606,8 +4816,10 @@ g("vH").textContent=S.count+"/"+S.perCh;g("vB").textContent=(S.vbat||0).toFixed(
 g("vF").textContent="v"+(S.fw||"?");
 ["poff","alt"].forEach(function(k){if(document.activeElement!==g(k))g(k).value=S[k]});
 offRows("toffs",S.toffs||[],"t","°C",.1,20);offRows("hoffs",S.hoffs||[],"h","%RH",.5,30);
-var hasP=(S.srcP||"-")!=="-";
-g("rP").className=hasP?"r":"r hd";g("rA").className=hasP?"r":"r hd";
+var hasP=(S.srcP||"-")!=="-",hasC=(S.srcC||"-")!=="-";
+// Vyska: s barometrem prepocet tlaku na hladinu more, bez nej kompenzace CO2.
+// Drive se ukazovala jen s barometrem - tedy prave tehdy ne, kdy ji CO2 potrebuje.
+g("rP").className=hasP?"r":"r hd";g("rA").className=(hasP||hasC)?"r":"r hd";
 g("pSen").className=S.sen?"p":"p hd";g("cSen").className=S.sen?"c":"c hd";
 g("pCo2").className=((S.srcC||"-")!=="-")?"p":"p hd";
 g("asc").checked=!!S.asc;
@@ -3622,6 +4834,11 @@ g("ascwn").className=(ascOk&&S.asc)?"wn":"wn hd";
 g("ascwn").textContent=(ascOk&&S.asc)?"Samokalibrace hledá týdenní minimum"
 +" a potřebuje nepřetržitý běh. Při měření po intervalech ji raději vypněte"
 +" a jednou za čas použijte kalibraci na 420 ppm.":"";
+g("calst").textContent=(S.calPend?"Naplánováno: "+S.calPend+" ppm na "+S.calSen
++" - začne po vypnutí hotspotu a odkladu "+S.calDelay+" s. ":"")+(S.cal?"Poslední: "+S.cal:"")
++(S.calWarn?" "+S.calWarn:"");
+var isScd=(S.srcC==="SCD41");g("rReset").className=isScd?"acts":"acts hd";
+g("resetH").className=isScd?"n":"n hd";
 g("sT").textContent=S.srcT||"—";g("sH").textContent=S.srcH||"—";
 g("sC").textContent=S.srcC||"—";g("sP").textContent=S.srcP||"—";
 if(S.sen){if(document.activeElement!==g("senwarm"))g("senwarm").value=S.senwarm;
@@ -3631,12 +4848,42 @@ TS=S.tsrc||"auto";HS=S.hsrc||"auto";
 g("auto").checked=!!S.chAuto;
 qGrid();
 Q.forEach(function(q){var e=g("q_"+q.k);if(e)e.checked=(S.channels||[]).indexOf(q.k)>=0});
+// Poradi kanalu a cisla grafu podle desky: plots [2,1] = prvni dva v grafu 1.
+ORD=(S.channels||[]).slice();GR={};var pl=S.plots||[],c=0;
+pl.forEach(function(n,i){for(var z=0;z<n;z++){if(ORD[c])GR[ORD[c]]=i+1;c++}});
 srcBtns();
 g("ivv").value=S.interval;
 Array.prototype.forEach.call(document.querySelectorAll(".iv button"),function(b){
 b.className=(+b.dataset.v===S.interval)?"on":""});qUpd();calc();senUpd()}
 function qUpd(){var a=g("auto").checked;
-Array.prototype.forEach.call(g("qg").querySelectorAll("input"),function(i){i.disabled=a});calc()}
+Array.prototype.forEach.call(g("qg").querySelectorAll("input"),function(i){i.disabled=a});plan();calc()}
+// Rozlozeni do grafu: stejne cislo = jeden graf. Sklada se z toho ch=a+b,c
+// a hlidaji se stejne limity jako ve firmwaru (stejna osa 3, ruzne jednotky 2).
+function axc(k){return /^temp/.test(k)?"t":/^hum/.test(k)?"h":/^pm/.test(k)?"pm":k}
+function qn(k){for(var i=0;i<Q.length;i++)if(Q[i].k===k)return Q[i].n;return k}
+function plan(){var a=g("auto").checked,on=[];
+Q.forEach(function(q){var e=g("q_"+q.k);if(e&&e.checked)on.push(q.k)});
+ORD=ORD.filter(function(k){return on.indexOf(k)>=0});
+on.forEach(function(k){if(ORD.indexOf(k)<0)ORD.push(k)});
+ORD.forEach(function(k){if(!GR[k]){var u=ORD.map(function(x){return GR[x]}),n=1;
+while(u.indexOf(n)>=0&&n<MAXCH)n++;GR[k]=n}});
+Q.forEach(function(q){var s=g("g_"+q.k);if(!s)return;var c=on.indexOf(q.k)>=0;
+s.className=(a||!c)?"hd":"";if(c)s.value=GR[q.k]||1});
+var gs=[],err="",wrn="";for(var n=1;n<=MAXCH;n++){
+var m=ORD.filter(function(k){return (GR[k]||1)===n});if(m.length)gs.push(m)}
+gs.forEach(function(m){var cl={};m.forEach(function(k){cl[axc(k)]=1});
+var mx=Object.keys(cl).length>1,lim=mx?2:3;
+if(m.length>lim&&!err)err=mx?"Veličiny s různými jednotkami: v jednom grafu nejvýš 2 (druhá osa Y).":"V jednom grafu jsou nejvýš 3 křivky.";
+var t=m.filter(function(k){return axc(k)==="t"});
+if(t.length>1&&(m.indexOf("temp.ds")>=0||m.indexOf("temp2")>=0)&&!wrn)
+wrn="DS18B20 bývá venku. Ve společné ose s pokojovou teplotou se v zimě osa roztáhne a denní průběh nebude vidět."});
+if(!on.length)err="Vyberte aspoň jednu veličinu.";
+var p=g("chp"),w=g("chw");
+p.innerHTML=gs.map(function(m,i){var cl={};m.forEach(function(k){cl[axc(k)]=1});
+return "<b>"+(i+1)+":</b> "+m.map(qn).join(" + ")+(m.length>1?(Object.keys(cl).length>1?" (dvě osy Y)":" (společná osa)"):"")}).join(" &middot; ");
+p.className=(a||!gs.length)?"n hd":"n";
+w.textContent=a?"":(err||wrn);w.className=(a||!(err||wrn))?"wn hd":"wn";
+return {cmd:gs.map(function(m){return m.join("+")}).join(","),err:err}}
 // Jeden radek na kazde pripojene cidlo. Firmware posila seznam v JSON,
 // stranka o cidlech nemusi nic vedet dopredu.
 function offRows(box,list,pre,unit,step,lim){var e=g(box);
@@ -3657,11 +4904,11 @@ req("/api/set?"+p.join("&"),b,"Použito ✓")}
 function qPick(el){
 var n=0;Q.forEach(function(q){var e=g("q_"+q.k);if(e&&e.checked)n++});
 if(n>MAXCH){el.checked=false;toast("Nejvýše "+MAXCH+" veličiny",1)}
-calc()}
-function applyCh(b){var s=g("auto").checked?"auto":
-Q.filter(function(q){var e=g("q_"+q.k);return e&&e.checked}).map(function(q){return q.k}).join(",");
-if(s!="auto"&&!s){toast("Vyberte aspoň jednu veličinu",1);return}
-req("/api/set?ch="+s,b,"Použito ✓")}
+if(!el.checked)delete GR[el.id.slice(2)];
+plan();calc()}
+function applyCh(b){var s="auto";
+if(!g("auto").checked){var p=plan();if(p.err){toast(p.err,1);return}s=p.cmd}
+req("/api/set?ch="+encodeURIComponent(s),b,"Použito ✓")}
 function setIv(v,b){req("/api/set?int="+v,b,"Použito ✓")}
 function clr(b){if(!confirm("Opravdu smazat celou historii měření?"))return;
 req("/api/clear",b,"Smazáno ✓")}
@@ -3841,11 +5088,28 @@ String apStatusJson(float vbat) {
   j += "\"poff\":" + String(cfg.pressOff, 2) + ",";
   j += "\"alt\":" + String(cfg.altitude, 0) + ",";
   j += "\"asc\":" + String(cfg.scdAsc) + ",";
+  // Kalibrace CO2: posledni vysledek (z NVS) a jestli nejaka ceka. Kalibrace
+  // bezi az po zavreni hotspotu, takze vysledek te soucasne neuvidi stranka
+  // nikdy - jen pristi otevreni. Proto ten text.
+  {
+    char cb[72];
+    calText(cb, sizeof(cb));
+    j += "\"cal\":\"" + String(calLast.magic == CAL_MAGIC ? cb : "") + "\",";
+    j += "\"calPend\":" + String(pendingCo2Ref >= 0 ? (int)pendingCo2Ref : 0) + ",";
+    j += "\"calDelay\":" + String((int)pendingCalDelayS) + ",";
+    j += "\"calWarn\":\"" + String(calWarnText()) + "\",";
+    j += "\"calSen\":\"" + String(calSensorName() ? calSensorName() : "") + "\",";
+  }
   j += "\"chAuto\":" + String(cfg.chAuto) + ",";
   j += "\"autoCount\":" + String(channelCount) + ",";
   j += "\"channels\":[";
   for (uint8_t c = 0; c < channelCount; c++)
     j += String(c ? "," : "") + "\"" + qKey(channels[c].q) + "\"";
+  // Pocet krivek v kazdem grafu, v poradi kanalu: [2,1] = prvni dva kanaly
+  // jsou v jednom grafu. Stranka z toho nastavi cisla grafu.
+  j += "],\"plots\":[";
+  for (uint8_t i = 0; i < plotCount; i++)
+    j += String(i ? "," : "") + String(plots[i].n);
   // Seznam velicin, ktere je z ceho merit - stranka z nej sklada nabidku
   // kanalu a nemusi o cidlech nic vedet dopredu.
   j += "],\"quants\":[";
@@ -3985,6 +5249,7 @@ void apHandleSet() {
   apTouch();
   bool dirty = false;
   bool intervalChanged = false;
+  String chErr;                  // odmitnuty vyber kanalu, posle se strance
   for (uint8_t i = 0; i < httpd.args(); i++) {
     String k = httpd.argName(i), v = httpd.arg(i);
     float f = v.toFloat();
@@ -4019,8 +5284,19 @@ void apHandleSet() {
       }
     }
     else if (k == "co2ref") {
+      // Stejne pravidlo jako v servisu: bez cidla CO2 by pozadavek nemel
+      // kdo provest.
       int c = v.toInt();
-      if (c >= 300 && c <= 2000) pendingCo2Ref = (int16_t)c;
+      if (c >= 300 && c <= 2000 && calSensorName()) {
+        pendingCo2Ref    = (int16_t)c;
+        pendingCalDelayS = CAL_DELAY_DEF;      // prepise pripadny caldelay nize
+      }
+    }
+    // Odklad startu kalibrace. Stranka ho posila ZA co2ref, takze ho vychozi
+    // hodnota vyse neprepise.
+    else if (k == "caldelay") {
+      int d = v.toInt();
+      if (d >= 0 && d <= CAL_DELAY_MAX) pendingCalDelayS = (uint16_t)d;
     }
     else if (k == "senwarm") {
       int s = v.toInt();
@@ -4061,36 +5337,28 @@ void apHandleSet() {
         for (uint8_t x = 0; x < MAX_CHANNELS; x++) cfg.chSel[x] = Q_NONE;
         dirty = true;
       } else {
+        // Stejny rozbor jako v servisu, vcetne slucovani (plus). Stranka
+        // posila plus zakodovane jako %2B, jinak by z nej server udelal mezeru.
         Quantity sel[MAX_CHANNELS];
-        for (uint8_t z = 0; z < MAX_CHANNELS; z++) sel[z] = Q_NONE;
-        uint8_t n = 0; int start = 0;
-        while (start <= (int)v.length() && n < MAX_CHANNELS) {
-          int comma = v.indexOf(',', start);
-          String part = (comma < 0) ? v.substring(start) : v.substring(start, comma);
-          part.trim(); part.toLowerCase();
-          if (part.length()) {
-            Quantity q = qFromKey(part);
-            // Stejne pravidlo jako v servisu: duplicita muze byt skryta,
-            // "temp" je pri tsrc=sen tataz vec jako "temp.sen".
-            if (q != Q_NONE && qOffered(q)) {
-              bool dup = false;
-              for (uint8_t z = 0; z < n; z++)
-                if (qCanonical(sel[z]) == qCanonical(q)) dup = true;
-              if (!dup) sel[n++] = q;
-            }
-          }
-          if (comma < 0) break;
-          start = comma + 1;
-        }
-        if (n > 0) {
-          cfg.chAuto = 0;
-          for (uint8_t x = 0; x < MAX_CHANNELS; x++) cfg.chSel[x] = (x < n) ? sel[x] : Q_NONE;
+        bool     joi[MAX_CHANNELS];
+        uint8_t  n = 0;
+        bool     overflow = false;
+        String   err;
+        if (chParse(v, sel, joi, n, overflow, err)) {
+          chStore(sel, joi, n);
           dirty = true;
+        } else {
+          chErr = err;
         }
       }
     }
   }
   if (dirty) { cfgSanitize(); relayoutHistory(intervalChanged); }
+  if (chErr.length()) {
+    chErr.replace("\\", "/"); chErr.replace("\"", "'");
+    httpd.send(200, "application/json", "{\"error\":\"" + chErr + "\"}");
+    return;
+  }
   httpd.send(200, "application/json", apStatusJson(apVbat));
 }
 
@@ -4112,6 +5380,14 @@ void apSetupRoutes() {
   httpd.on("/api/senclean", [](){
     apTouch();
     pendingFanClean = det.sen6x;     // provede se az pri dalsim mereni
+    httpd.send(200, "application/json", apStatusJson(apVbat));
+  });
+  httpd.on("/api/co2reset", [](){
+    apTouch();
+    if (!scd41FactoryReset()) {
+      httpd.send(500, "application/json", "{\"error\":\"reset selhal\"}");
+      return;
+    }
     httpd.send(200, "application/json", apStatusJson(apVbat));
   });
   httpd.on("/api/exit",   [](){
@@ -4277,6 +5553,30 @@ void loadHistory(uint32_t sig) {
   }
 }
 
+// Pred merenim: kdyz ceka kalibrace CO2, ukazat na displeji, ze probiha.
+// Nic se nekresli, kdyz kalibrace stejne nepobezi - SEN6x pri slabe baterii
+// nespoustime a obrazovka "probiha" by lhala. Vysledek (i ten neuspesny)
+// pak ukaze radek napovedy na beznem displeji.
+static void calScreenIfPending() {
+  if (pendingCo2Ref < 0) return;
+  const char *name = calSensorName();
+  if (!name) return;                      // nema co merit CO2 - doresi doMeasurement
+  if (!det.scd41) {
+    float v = readVBat();
+    if (!isnan(v) && v < SEN_VBAT_MIN) return;
+  }
+  SPI.begin(EPD_CLK, EPD_MISO, EPD_MOSI, EPD_CS);
+  display.init(115200, true, 2, false);
+  CalView v = { name, pendingCo2Ref,
+                pendingCalDelayS ? (uint8_t)CALV_DELAY : (uint8_t)CALV_SETTLE,
+                NAN, NAN, NAN, pendingCalDelayS };
+  renderCalScreen(v);
+  // Jen vypnout, ne uspat: behem kalibrace se oblast se stavem prekresluje
+  // castecne a radic k tomu potrebuje zachovany obsah pameti.
+  display.powerOff();
+  calDisplayOn = true;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(50);
@@ -4357,6 +5657,10 @@ void setup() {
   delay(120);
 
   cfgLoad();
+  // Po tvrdem startu nemusi RTC RAM platit. Posledni vysledek kalibrace CO2
+  // se nacte z NVS (hotspot i 'list' ho ukazuji) a na displeji se znovu
+  // neukazuje - patri k minulemu behu.
+  if (hardStart) { calShowLeft = 0; calLoadNVS(); }
   detectSensors();
   buildChannels();
   uint32_t sig = buildSignature();
@@ -4372,10 +5676,25 @@ void setup() {
   if (wantService) {
     allowLightSleep = false;     // v servisu bezi USB konzole
     runService();
+    // Pool je ted v poradi kanalu, ktere platilo na konci servisu. Kdyz
+    // servis skoncil timeoutem bez ulozeni, cfgLoad() vrati puvodni poradi
+    // a pool se musi prehodit zpatky, jinak by se vzorky cetly jako jina
+    // velicina.
+    Quantity lay[MAX_CHANNELS];
+    uint8_t  layN = channelCount;
+    for (uint8_t i = 0; i < MAX_CHANNELS; i++) lay[i] = (i < channelCount) ? channels[i].q : Q_NONE;
     cfgLoad();
     buildChannels();
+    if (histSlots == histPerCh && !histPermute(lay, layN)) {
+      bool same = (layN == channelCount);
+      for (uint8_t i = 0; same && i < channelCount; i++) if (lay[i] != channels[i].q) same = false;
+      if (!same) histClear();
+    }
     sig = buildSignature();
     rtcSignature = sig;          // zmeny v servisu jsou vedome
+    // Prehozene poradi kanalu: NVS ma data ve starem poradi pod starym
+    // podpisem. Po tvrdem restartu by se nenacetla, tak je ulozime hned.
+    if (histRemapped) { histSaveNVS(sig, readVBat()); histRemapped = false; }
     // Kdyz uzivatel v servisu menil ch nebo int a pak nechal dobehnout
     // timeout bez ulozeni, zustane histSlots od docasneho rozlozeni.
     // Bez teto kontroly by nesoulad prezil do dalsiho bootu.
@@ -4403,6 +5722,7 @@ void setup() {
     vb = readVBat();
     r.vbat = vb;
   } else {
+    calScreenIfPending();           // servis mohl naplanovat kalibraci CO2
     r = doMeasurement();
     vb = r.vbat;                    // doMeasurement uz baterii precetl
   }
@@ -4420,13 +5740,21 @@ void setup() {
     if (newSig != sig) {
       // Vedoma zmena uzivatele - na rozdil od vypadku cidla se nepotvrzuje.
       // Vzorky se starym rozestupem nebo jinym rozlozenim kanalu by rozbily
-      // casovou osu, proto zakladame historii znovu.
+      // casovou osu, proto zakladame historii znovu. Vyjimka: jen jine
+      // poradi kanalu, ktere relayoutHistory() uz v poolu prehodila.
       sig = newSig;
       rtcSignature = sig;
-      histClear();
-      histEraseNVS();
-      Serial.println("Nastaveni zmeneno pres WiFi - zalozena nova historie.");
+      if (histRemapped) {
+        histSaveNVS(sig, vb);
+        Serial.println("Grafy preskladany pres WiFi - historie zustava.");
+      } else {
+        histClear();
+        histEraseNVS();
+        Serial.println("Nastaveni zmeneno pres WiFi - zalozena nova historie.");
+      }
     }
+    histRemapped = false;
+    calScreenIfPending();         // hotspot mohl naplanovat kalibraci CO2
     r = doMeasurement();          // po konfiguraci cerstve mereni
     vb = r.vbat;
   }
@@ -4444,7 +5772,19 @@ void setup() {
                   r.pm1, r.pm25, r.pm4, r.pm10,
                   qValue(r, Q_T_SEN), qValue(r, Q_H_SEN), r.hcho);
 
-  histPush(r);
+  // Po servisu nebo hotspotu byla deska minuty vzhuru (casto na USB, ktere
+  // jeste nabiji baterii) a SHT40 na desce je ohrate - v logu 25,7 degC proti
+  // 21,7 degC o pet minut pozdeji, vlhkost o 7 % nize. Takovy vzorek by
+  // v grafu udelal spicku. Teplotu a vlhkost z desky proto do HISTORIE
+  // neukladame (v grafu bude kratka mezera), displej ukaze, co se namerilo.
+  // Cidla na kabelu (SEN6x, SCD41, DS18B20) ohrate nejsou a ukladaji se.
+  Reading hr = r;
+  if (wantService || wantHotspot) {
+    hr.tSht = NAN; hr.hSht = NAN;
+    if (tsrcPrimary() == TSRC_SHT) hr.temp = NAN;
+    if (hsrcPrimary() == HSRC_SHT) hr.hum  = NAN;
+  }
+  histPush(hr);
 
   // AZ TED, po zapisu do historie: doplnime na displej posledni znamou
   // hodnotu ze SEN6x, kdyz cidlo v tomto cyklu nebezelo. Historie uz ma
@@ -4465,6 +5805,7 @@ void setup() {
   SPI.begin(EPD_CLK, EPD_MISO, EPD_MOSI, EPD_CS);
   display.init(115200, true, 2, false);
   render(r, vb);
+  if (calShowLeft > 0) calShowLeft--;   // vysledek kalibrace jen na par prekresleni
 
   goToSleep();
 }
