@@ -1,78 +1,41 @@
 /*
- * MeteoEink426 v4 — LaskaKit ESPink-4.26 (ESP32-S3, ePaper GDEQ0426T82 800x480)
- * ============================================================================
- * Offline meteostanice s autodetekci vice cidel a volitelnymi kanaly grafu.
+ * MeteoEink426 - offline meteostanice s e-ink displejem
+ * Deska: LaskaKit ESPink-4.26 (ESP32-S3, e-paper GDEQ0426T82 480x800)
+ * Kod a dokumentace: https://github.com/petus/meteoeink
  *
- * SHT40 je vzdy zaklad (teplota + vlhkost, na desce). Soucasne se detekuji:
- *   - SHT4x   : teplota + vlhkost         (I2C 0x44 / 0x45 / 0x46)
- *   - SCD41   : CO2                       (I2C 0x62)
- *   - SEN6x   : PM1/2.5/4/10, RH/T, CO2   (I2C 0x6B) - viz nize
- *   - BME280  : tlak (+ vlhkost zalozne)  (I2C 0x76/0x77, chip ID 0x60)
- *   - BMP280  : tlak                      (I2C 0x76/0x77, chip ID 0x56-0x58)
- *   - DS18B20 : druha teplota             (OneWire GPIO4)
+ * PREKLAD
+ *   Arduino IDE s jadrem arduino-esp32, deska "ESP32S3 Dev Module",
+ *   Flash Size 16MB, PSRAM Disabled.
  *
- * SENSIRION SEN6x (novinka ve v4)
- * -------------------------------
- * Pouzivaji se OFICIALNI KNIHOVNY SENSIRION, ve skeci je jen tenka rozbocovaci
- * vrstva (sekce "SENSIRION SEN6x" nize). Podporovane varianty, jak je pozna
- * senKindFromName():
+ * KNIHOVNY
+ *   GxEPD2, Adafruit GFX               displej
+ *   Adafruit BME280, Adafruit BMP280   tlak
+ *   SparkFun SCD4x Arduino Library     CO2 (SCD41)
+ *   OneWire, DallasTemperature         DS18B20
+ *   QRCode (Richard Moore)             QR kod hotspotu
+ *   Sensirion I2C SEN66, SEN63C        povinne
+ *   Sensirion I2C SEN65, SEN68, SEN69C volitelne (staci nainstalovat)
+ *   Sensirion Core                     zavislost knihoven Sensirion
+ *   SHT40 ma vlastni ovladac v tomto souboru (knihovna Adafruit umi jen 0x44).
  *
- *   SEN63C : PM + RH/T + CO2                    knihovna povinna
- *   SEN66  : PM + RH/T + VOC + NOx + CO2        knihovna povinna
- *   SEN65  : PM + RH/T + VOC + NOx              knihovna volitelna
- *   SEN68  : PM + RH/T + VOC + NOx + HCHO       knihovna volitelna
- *   SEN69C : PM + RH/T + VOC + NOx + HCHO + CO2 knihovna volitelna
+ * CIDLA (detekuji se sama pri kazdem startu)
+ *   SHT40     teplota, vlhkost              I2C 0x44/0x45/0x46, na desce
+ *   SCD41     CO2                           I2C 0x62 (SCD40 nefunguje)
+ *   SEN6x     prach, teplota, vlhkost, CO2  I2C 0x6B
+ *   BME280    tlak, vlhkost                 I2C 0x76/0x77
+ *   BMP280    tlak                          I2C 0x76/0x77
+ *   DS18B20   druha teplota                 GPIO4, pull-up 4,7 kOhm na 3,3 V
+ *   I2C cidla pres konektor uSup, napajeni spina GPIO47.
  *
- * Varianta se pozna za behu z prikazu "Get Product Name" (0xD014) - ten je
- * v cele rade stejny, takze se ptat muze kterakoli trida. Volitelne varianty
- * staci nainstalovat ve Spravci knihoven a skec znovu prelozit.
- * (SEN60 a SEN62 podporovane nejsou - SEN60 ma jinou adresu i sadu prikazu
- * a pro SEN62 Sensirion knihovnu nedodava.)
+ * OVLADANI (tlacitko drzet pri restartu)
+ *   PUSH (GPIO40) 2-5 s    nastaveni pres USB, konfigurator meteoeink.chiptron.cz
+ *   PUSH (GPIO40) pres 5 s WiFi hotspot, SSID, heslo a QR kod na displeji
+ *   DOWN (GPIO41) 5 s      smaze historii mereni
  *
- * VOC a NOx se zamerne NECTOU. Jejich index pocita adaptivni algoritmus, ktery
- * potrebuje bezet nepretrzite hodiny az dny. Deska se mezi merenimi kompletne
- * odpojuje od napajeni, takze by algoritmus vzdy startoval od nuly a vracel
- * jen nesmyslnou konstantu kolem 100. Ze stejneho duvodu neni pouzitelne HCHO
- * u SEN68/SEN69C - datasheet mu dava 60 s od zapnuti, nez zacne hlasit cislo.
- *
- * DVA INTERVALY: teplota, vlhkost a tlak se meri v zakladnim intervalu (int),
- * prach a CO2 v jeho nasobku (senmult, 1x az 4x). Duvodem je spotreba - viz
- * nize.
- *
- * SPOTREBA: SEN6x ma ventilator, ktery nejde vypnout, a bezici cidlo bere
- * 75-110 mA (SEN66 typicky 90 mA). Proto se cidlo napaji jen po dobu mereni
- * pres spinac uSup (GPIO47) a ESP32 po dobu zahrivani spi v light-sleep.
- * Datasheet zada ~30 s behu, nez je PM platne. Pri intervalu 5 min to znamena
- * radove 200 mAh/den - viz varovani v servisu i na webu.
- *
- * Z dostupnych velicin se kresli az 4 grafy. Vyber je automaticky podle
- * priority, nebo rucne prikazem  ch=co2,pm25,temp  v servisnim rezimu.
- * Plus slucuje veliciny do jednoho grafu:  ch=temp.sht+temp.sen,co2
- *
- * ADAPTIVNI HISTORIE: pamet je spolecny pool. Cim min kanalu, tim delsi
- * historie. Delka take zavisi na nastavenem intervalu mereni.
- *   3 kanaly / 5 min  = 72 h      1 kanal / 5 min  = 7 dni
- *   3 kanaly / 1 min  = 14 h      3 kanaly / 30min = 18 dni
- *
- * OCHRANA HISTORIE: v NVS je podpis sestavy (cidla + kanaly + interval).
- * Pri neshode se historie NEMAZE hned - odlisna sestava se musi potvrdit
- * dvema po sobe jdoucimi starty, aby vypadek cidla nesmazal data.
- *
- * TLACITKA (drzet pri restartu):
- *   PUSH (GPIO40) pustit mezi 2-5 s = servisni rezim pres USB (115200)
- *   PUSH (GPIO40) drzet pres 5 s    = WiFi hotspot s konfiguracni strankou
- *                                     (SSID, heslo a QR kod se ukazou na displeji,
- *                                      vypne se po 5 min necinnosti)
- *   DOWN (GPIO41) drzet 5 s         = smazani cele historie mereni
- *
- * Knihovny: GxEPD2, Adafruit GFX, Adafruit BME280, Adafruit BMP280,
- *           SparkFun SCD4x, OneWire, DallasTemperature,
- *           QRCode (Richard Moore) - QR kod pro pripojeni k hotspotu,
- *           Sensirion I2C SEN66 + SEN63C (+ volitelne SEN65 / SEN68 / SEN69C),
- *           Sensirion Core - zavislost predchozich
- * SHT4x ma vlastni ovladac primo v tomto souboru, protoze Adafruit_SHT4x umi
- * jen adresu 0x44 a SHT40 se vyrabi i pro 0x45 a 0x46.
- * Board: "ESP32S3 Dev Module", Flash 16MB, PSRAM: Disabled (neni potreba).
+ * Pozor pri upravach: Arduino IDE generuje prototypy funkci jen pred raw
+ * stringem AP_PAGE. Funkci definovanou za nim, ktera se vola driv, je potreba
+ * deklarovat rucne. A zadna definice funkce nesmi byt pred blokem typu
+ * v sekci VELICINY A CIDLA.
  */
 
 #include <Arduino.h>
@@ -107,7 +70,7 @@
 // duvod viz varovani v sekci VELICINY A CIDLA.
 // ============================================================================
 #define FW_NAME     "MeteoEink426"
-#define FW_VERSION  "4.4.0"
+#define FW_VERSION  "4.5.1"
 
 // ============================================================================
 // SYMBOLY, KTERE FONTY ADAFRUIT GFX NEMAJI
@@ -132,7 +95,7 @@
 #define U_UGM3  SYM_MU "g/m" SYM_CUB // µg/m³
 
 // ============================================================================
-// PINY — LaskaKit ESPink-4.26
+// PINY - LaskaKit ESPink-4.26
 // ============================================================================
 #define PIN_POWER    47
 #define PIN_I2C_SDA  42
@@ -155,7 +118,12 @@
 // ============================================================================
 // LIMITY A VYCHOZI HODNOTY
 // ============================================================================
-#define MAX_CHANNELS      4        // displej i historie zvladnou 4 grafy
+// Veliciny (kanaly historie) a grafy (panely) jsou dva ruzne limity. Displej
+// unese 4 grafy; kanalu muze byt az 6, kdyz se nektere slouci do spolecneho
+// grafu (napr. vnitrni + venkovni teplota, vnitrni + venkovni vlhkost, CO2,
+// tlak). Kazdy kanal navic zkracuje historii - pool se deli mezi kanaly.
+#define MAX_CHANNELS      6        // max. velicin v historii
+#define MAX_PLOTS         4        // max. grafu na displeji
 // Slucovani kanalu do jednoho panelu. Strop je 3, navrzeno je to na 2:
 // pri trech krivkach uz se cárkovana a teckovana cara na rozkmitanem prubehu
 // pri 219 DPI rozlisi spatne a rozsahy serii se nevejdou do zahlavi na jeden
@@ -359,7 +327,7 @@ uint8_t  channelCount = 0;
 // kanaly - tim odpada mapovaci pole i moznost, aby si panel "ukradl" kanal
 // z prostredka.
 struct Plot { uint8_t first; uint8_t n; };
-Plot     plots[MAX_CHANNELS];
+Plot     plots[MAX_PLOTS];
 uint8_t  plotCount = 0;
 
 uint16_t histPerCh = 0;            // vzorku na kanal (dopocitano)
@@ -423,9 +391,13 @@ float qValue(const Reading &r, Quantity q);
 // ============================================================================
 // "MEK7" - v4 pridala polozky pro SEN6x, v4.1 rozdelila offsety podle cidel
 // a v4.2 pribyla volba hlavniho zdroje teploty a vlhkosti. Struktura se tim
-// zmenila, takze se stara konfigurace zamerne ignoruje a nabehnou vychozi
+// zmenila, takze se starsi konfigurace zamerne ignoruje a nabehnou vychozi
 // hodnoty - cist ji do nove struktury by nacetlo nesmysly.
-#define CFG_MAGIC 0x4D454B37u
+// "MEK8" - v4.5 rozsirila vyber kanalu ze 4 na 6. Konfigurace MEK7 se
+// neztraci, cfgLoad() ji prevede (ConfigMek7 nize).
+#define CFG_MAGIC      0x4D454B38u
+#define CFG_MAGIC_MEK7 0x4D454B37u
+#define MEK7_CHANNELS  4
 
 struct Config {
   uint32_t magic;
@@ -453,6 +425,27 @@ struct Config {
   uint8_t  hSrcPref;
 };
 Config  cfg;
+
+// Konfigurace do v4.4 (vcetne) se ctyrmi kanaly. Jen pro prevod v cfgLoad() -
+// poradi a typy polozek musi presne odpovidat puvodni strukture.
+struct ConfigMek7 {
+  uint32_t magic;
+  float    tOff[TSRC_COUNT];
+  float    hOff[HSRC_COUNT];
+  float    pressOff;
+  float    altitude;
+  uint8_t  scdAsc;
+  uint8_t  intervalMin;
+  uint8_t  chAuto;
+  uint8_t  chSel[MEK7_CHANNELS];
+  char     apPass[13];
+  uint8_t  senWarmS;
+  uint8_t  senMult;
+  uint8_t  lightSleep;
+  uint8_t  senCleanDays;
+  uint8_t  tSrcPref;
+  uint8_t  hSrcPref;
+};
 int16_t pendingCo2Ref = -1;        // jednorazovy pozadavek, neuklada se
 
 // Vysledek posledni kalibrace CO2.
@@ -474,12 +467,20 @@ int16_t pendingCo2Ref = -1;        // jednorazovy pozadavek, neuklada se
 #define CAL_E_BIGCORR 7            // drive: velka korekce zablokovana (stare zaznamy v NVS)
 #define CAL_OK_BIG    8            // FRC probehla, korekce ale nad CAL_MAX_CORR
 #define CAL_RESET     9            // obnovena tovarni kalibrace (co2reset)
+// Proc se kalibrace neustalila (CAL_E_UNSTABLE). Uklada se v CalResult.corr
+// jako duvod * 1000 + hodnota v desetinach (strop 99,9; vejde se do int16);
+// 0 = starsi zaznam bez duvodu.
+#define CALF_NOISE    1            // rozptyl mereni nad CAL_RESID_MAX
+#define CALF_FALL     2            // CO2 porad klesa
+#define CALF_RISE     3            // CO2 porad stoupa
+#define CALF_TEMP     4            // teplota cidla se meni
+#define CALF_HOLD     5            // podminky platily, ale ne CAL_HOLD_MS v kuse
 
 struct CalResult {
   uint8_t magic;                   // CAL_MAGIC, jinak zaznam neplati
   uint8_t status;                  // CAL_OK / CAL_E_...
   int16_t target;                  // reference [ppm]
-  int16_t corr;                    // korekce [ppm], plati jen pri CAL_OK
+  int16_t corr;                    // korekce [ppm] pri CAL_OK, u CAL_E_UNSTABLE duvod (CALF_*)
   char    sensor[8];               // "SCD41", "SEN63C", ...
 };
 RTC_DATA_ATTR CalResult calLast     = { 0, 0, 0, 0, "" };
@@ -601,10 +602,36 @@ void cfgLoad() {
   cfgDefaults();
   if (prefs.begin(NVS_NS, true)) {
     if (prefs.isKey(NVS_CFG)) {
-      Config tmp;
-      if (prefs.getBytes(NVS_CFG, &tmp, sizeof(tmp)) == sizeof(tmp) &&
-          tmp.magic == CFG_MAGIC) {
-        cfg = tmp;
+      // Pozor: Config (MEK8) a ConfigMek7 maji diky zarovnani STEJNOU
+      // velikost (6 kanalu se veslo do vyplne za hSrcPref). O verzi proto
+      // rozhoduje magic, ne delka zaznamu.
+      size_t len = prefs.getBytesLength(NVS_CFG);
+      union { Config n; ConfigMek7 o; } buf;
+      if (len <= sizeof(buf) && prefs.getBytes(NVS_CFG, &buf, len) == len &&
+          len >= sizeof(uint32_t)) {
+        if (buf.n.magic == CFG_MAGIC && len == sizeof(Config)) {
+          cfg = buf.n;
+        } else if (buf.o.magic == CFG_MAGIC_MEK7 && len == sizeof(ConfigMek7)) {
+          // Prevod z v4.4 se 4 kanaly (MEK7): polozky se zkopiruji jedna po druhe,
+          // kanaly 5 a 6 zustanou prazdne. Ulozi se az pri pristim save.
+          const ConfigMek7 &o = buf.o;
+          for (uint8_t i = 0; i < TSRC_COUNT; i++) cfg.tOff[i] = o.tOff[i];
+          for (uint8_t i = 0; i < HSRC_COUNT; i++) cfg.hOff[i] = o.hOff[i];
+          cfg.pressOff     = o.pressOff;
+          cfg.altitude     = o.altitude;
+          cfg.scdAsc       = o.scdAsc;
+          cfg.intervalMin  = o.intervalMin;
+          cfg.chAuto       = o.chAuto;
+          for (uint8_t i = 0; i < MAX_CHANNELS; i++)
+            cfg.chSel[i] = (i < MEK7_CHANNELS) ? o.chSel[i] : (uint8_t)Q_NONE;
+          memcpy(cfg.apPass, o.apPass, sizeof(cfg.apPass));
+          cfg.senWarmS     = o.senWarmS;
+          cfg.senMult      = o.senMult;
+          cfg.lightSleep   = o.lightSleep;
+          cfg.senCleanDays = o.senCleanDays;
+          cfg.tSrcPref     = o.tSrcPref;
+          cfg.hSrcPref     = o.hSrcPref;
+        }
       }
     }
     prefs.end();
@@ -636,7 +663,7 @@ bool cfgSave() {
 }
 
 // ============================================================================
-// HISTORIE — spolecny pool v RTC RAM
+// HISTORIE - spolecny pool v RTC RAM
 // Rozlozeni: kanal c zabira histPool[c*histPerCh .. c*histPerCh+histPerCh-1]
 // Hodnoty int16: teplota/vlhkost x100, tlak (hPa-900)x10, CO2 primo v ppm.
 // ============================================================================
@@ -807,7 +834,7 @@ void powerOn() {
 void powerOff() { digitalWrite(PIN_POWER, LOW); }
 
 // ============================================================================
-// SENSIRION SEN6x — tenka vrstva nad oficialnimi knihovnami Sensirion
+// SENSIRION SEN6x - tenka vrstva nad oficialnimi knihovnami Sensirion
 // ============================================================================
 // Cela rada SEN6x mluvi stejnym protokolem na adrese 0x6B a knihovny se lisi
 // jen tim, kolik hodnot vrati prikaz pro cteni. Konfiguracni prikazy (start,
@@ -1231,6 +1258,58 @@ uint8_t boschChipIdAt(uint8_t addr) {
   return Wire.read();
 }
 
+// ----------------------------------------------------------------------------
+// VARIANTA SCD4x
+// Na adrese 0x62 muze sedet SCD40, SCD41 i SCD43 - maji stejne pouzdro
+// i prikazy. SCD40 ale neumi mereni single shot, ktere firmware pouziva
+// (deska cidlo mezi merenimi vypina), takze s nim CO2 nefunguje. Na trhu se
+// SCD40 obcas prodava jako SCD41. Varianta se cte prikazem get_sensor_variant
+// (0x202F, datasheet SCD4x): horni ctyri bity slova, 0 = SCD40, 1 = SCD41,
+// 5 = SCD43. Starsi kusy prikaz neznaji - pak je varianta neznama a nic se
+// nehlasi (nejde o chybu).
+// ----------------------------------------------------------------------------
+#define SCD_VAR_SCD40   0
+#define SCD_VAR_SCD41   1
+#define SCD_VAR_SCD43   5
+#define SCD_VAR_UNKNOWN 0xFF
+uint8_t  scdVariant    = SCD_VAR_UNKNOWN;
+uint16_t scdVariantRaw = 0;
+
+static uint8_t scdCrc(const uint8_t *d, uint8_t n) {
+  uint8_t crc = 0xFF;                       // Sensirion CRC-8, polynom 0x31
+  for (uint8_t i = 0; i < n; i++) {
+    crc ^= d[i];
+    for (uint8_t b = 0; b < 8; b++) crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+// Precte variantu. Cidlo musi byt v necinnosti - po zapnuti napajeni je.
+uint8_t scd4xReadVariant() {
+  Wire.beginTransmission((uint8_t)0x62);
+  Wire.write(0x20); Wire.write(0x2F);
+  if (Wire.endTransmission() != 0) return SCD_VAR_UNKNOWN;
+  delay(2);                                 // datasheet: 1 ms
+  if (Wire.requestFrom((uint8_t)0x62, (uint8_t)3) != 3) return SCD_VAR_UNKNOWN;
+  uint8_t b[3] = { (uint8_t)Wire.read(), (uint8_t)Wire.read(), (uint8_t)Wire.read() };
+  if (scdCrc(b, 2) != b[2]) return SCD_VAR_UNKNOWN;
+  scdVariantRaw = ((uint16_t)b[0] << 8) | b[1];
+  uint8_t v = (uint8_t)(scdVariantRaw >> 12);
+  return (v == SCD_VAR_SCD40 || v == SCD_VAR_SCD41 || v == SCD_VAR_SCD43) ? v : SCD_VAR_UNKNOWN;
+}
+
+const char* scdVariantName(uint8_t v) {
+  switch (v) {
+    case SCD_VAR_SCD40: return "SCD40";
+    case SCD_VAR_SCD41: return "SCD41";
+    case SCD_VAR_SCD43: return "SCD43";
+    default:            return "neznama";
+  }
+}
+
+// SCD40 single shot neumi - CO2 s nim merit nebude.
+static inline bool scdVariantBad() { return scdVariant == SCD_VAR_SCD40; }
+
 // Jeden pruchod detekci.
 Detected detectOnce() {
   Detected d;
@@ -1264,6 +1343,16 @@ void detectSensors() {
   // sjednoceni: co bylo videt aspon jednou, povazujeme za pritomne
   det.scd41   = a.scd41   || b.scd41;
   det.ds18b20 = a.ds18b20 || b.ds18b20;
+  scdVariant  = det.scd41 ? scd4xReadVariant() : SCD_VAR_UNKNOWN;
+  if (det.scd41) {
+    if (scdVariant == SCD_VAR_UNKNOWN)
+      Serial.println("SCD4x: variantu nelze precist (starsi kus nebo napodobenina).");
+    else
+      Serial.printf("SCD4x: varianta %s (0x%04X)\n", scdVariantName(scdVariant), scdVariantRaw);
+    if (scdVariantBad())
+      Serial.println("POZOR: na 0x62 je SCD40, ne SCD41. SCD40 neumi mereni single shot,"
+                     " ktere deska pouziva - CO2 nebude merit spravne.");
+  }
   // SEN6x umi CO2 sam, dva zdroje CO2 by si v grafu prekazely.
   // Prednost ma SCD41 - je presnejsi a levnejsi na energii.
   if (det.sen6x && det.scd41)
@@ -1391,9 +1480,8 @@ const char* srcCo2Name() {
 }
 const char* srcPressName() {
   // Tlak umi jen barometr - SEN6x ani SCD41 ho nemeri. Namerena hodnota
-  // se ale posila do SEN6x jako vstup pro kompenzaci CO2 (setAmbientPressure).
-  // SCD41 dostava jen nadmorskou vysku: jeho cteni v doMeasurement() probiha
-  // driv nez barometr, takze by tlak v tu chvili jeste nebyl k dispozici.
+  // se ale posila do SEN6x i SCD41 jako vstup pro kompenzaci CO2
+  // (setAmbientPressure); barometr se proto v doMeasurement() cte jako prvni.
   if (det.bosch != BOSCH_NONE) return boschName();
   return "-";
 }
@@ -1530,6 +1618,13 @@ void buildPlots() {
       if (p.n >= (mixed ? MAX_PER_PLOT_MIX : MAX_PER_PLOT)) startNew = true;
     }
 
+    if (startNew && plotCount >= MAX_PLOTS) {
+      // Pojistka: vic grafu displej neunese. Parser i webove stranky to
+      // nedovoli, sem se dostane jen poskozena konfigurace. Zbyle kanaly se
+      // zahodi, aby historie nebyla rozdelena pro kanaly, ktere nikdo nevidi.
+      channelCount = c;
+      break;
+    }
     if (startNew) {
       plots[plotCount].first = c;
       plots[plotCount].n     = 1;
@@ -1557,8 +1652,9 @@ bool plotDualAxis(uint8_t pi) {
 // Sestavi kanaly: bud rucni vyber, nebo automaticka priorita.
 void buildChannels() {
   channelCount = 0;
+  uint8_t limit = MAX_CHANNELS;
   auto add = [&](Quantity q, bool join) {
-    if (channelCount >= MAX_CHANNELS || q == Q_NONE || !qAvailable(q)) return;
+    if (channelCount >= limit || q == Q_NONE || !qAvailable(q)) return;
     // Bez duplicit - a to i skrytych. "temp" pri tsrc=sen je tataz vec jako
     // "temp.sen", takze by se jinak kreslily dve totozne krivky a zabraly
     // dva ze ctyr slotu.
@@ -1585,7 +1681,9 @@ void buildChannels() {
     // Automatika NIKDY neslucuje. Slucovani je vzdy vedome rozhodnuti
     // uzivatele: dve pokojova cidla ve spolecnem grafu davaji smysl, pokojova
     // a venkovni teplota v zime taky ne - osa by se roztahla na 38 °C a
-    // z denniho prubehu by nebylo videt nic.
+    // z denniho prubehu by nebylo videt nic. Bez slucovani je kazda velicina
+    // jeden graf, takze automatika bere nejvys MAX_PLOTS velicin.
+    limit = MAX_PLOTS;
     add(Q_CO2, false); add(Q_PM25, false); add(Q_TEMP, false);
     add(Q_PRESS, false); add(Q_TEMP2, false); add(Q_HUM, false);
   }
@@ -1690,7 +1788,7 @@ uint8_t sensorNames(const char *out[], uint8_t maxItems) {
   uint8_t n = 0;
   if (shtAddr    && n < maxItems) out[n++] = "SHT4x";
   if (det.sen6x  && n < maxItems) out[n++] = senKindName(senKind);
-  if (det.scd41  && n < maxItems) out[n++] = "SCD41";
+  if (det.scd41  && n < maxItems) out[n++] = scdVariantBad() ? "SCD40 (!)" : "SCD41";
   if (det.bosch == BOSCH_BME280 && n < maxItems) out[n++] = "BME280";
   if (det.bosch == BOSCH_BMP280 && n < maxItems) out[n++] = "BMP280";
   if (det.ds18b20 && n < maxItems) out[n++] = "DS18B20";
@@ -1941,7 +2039,21 @@ void calText(char *o, size_t n) {
     case CAL_E_LOWBAT: snprintf(o, n, "Kalibrace CO2 (%s) neprobehla - slaba baterie", s); break;
     case CAL_E_START:  snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo nenabehlo", s); break;
     case CAL_E_SHOTS:  snprintf(o, n, "Kalibrace CO2 (%s) selhala - cidlo nemerilo", s); break;
-    case CAL_E_UNSTABLE: snprintf(o, n, "Kalibrace CO2 (%s) neprobehla - neustalilo se", s); break;
+    case CAL_E_UNSTABLE: {
+      const int why = calLast.corr / 1000, t = calLast.corr % 1000;
+      switch (why) {
+        case CALF_NOISE:
+          if (t >= 999) snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: rozptyl >99 ppm", s);
+          else          snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: rozptyl %d ppm", s, (t + 5) / 10);
+          break;
+        case CALF_FALL:  snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: CO2 klesa", s); break;
+        case CALF_RISE:  snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: CO2 stoupa", s); break;
+        case CALF_TEMP:  snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: meni se teplota", s); break;
+        case CALF_HOLD:  snprintf(o, n, "Kalibrace CO2 (%s) neprobehla: hodnoty kolisaji", s); break;
+        default:         snprintf(o, n, "Kalibrace CO2 (%s) neprobehla - neustalilo se", s); break;
+      }
+      break;
+    }
     // Korekce se uklada i tady (odhad z mereni), at je videt, o kolik slo.
     case CAL_E_BIGCORR: snprintf(o, n, "Kalibrace CO2 (%s) zrusena - korekce %+d ppm", s, (int)calLast.corr); break;
     default:           snprintf(o, n, "Kalibrace CO2 (%s) - neznamy vysledek", s); break;
@@ -1954,6 +2066,24 @@ const char* calWarnText() {
   if (calLast.status == CAL_OK_BIG)
     return "Neobvykle velka korekce. Pokud deska nebyla na cerstvem vzduchu,"
            " kalibraci zopakujte. Opravuje-li predchozi spatnou kalibraci, je to v poradku.";
+  if (calLast.status == CAL_E_UNSTABLE) {
+    switch (calLast.corr / 1000) {
+      case CALF_NOISE:
+        return "Jednotliva mereni skacou vic, nez ma zdrave cidlo (typicky +-10 ppm)."
+               " U SCD41 zkuste obnovit tovarni kalibraci. Pokud mereni skace dal,"
+               " cidlo je nejspis vadne.";
+      case CALF_FALL:
+      case CALF_RISE:
+        return "CO2 se do konce mereni neustalilo. Nechte desku na miste dele"
+               " pred startem (vetsi odklad), dal od lidi a vyfuku.";
+      case CALF_TEMP:
+        return "Teplota cidla se porad menila - deska se ohriva nebo chladne."
+               " Dejte ji do stinu a spustte kalibraci, az se srovna s okolim.";
+      case CALF_HOLD:
+        return "Hodnoty se chvili ustalily a pak zase rozkolisaly - nejspis"
+               " zmeny vetru nebo lide v blizkosti. Zkuste to jinde nebo jindy.";
+    }
+  }
   return "";
 }
 
@@ -2143,6 +2273,20 @@ uint8_t calRun(const char *sensor, CalSampleFn sample, int32_t &corrExp) {
                     calFmt(fs, sizeof(fs), sC, "%.1f"), calFmt(fr, sizeof(fr), rms, "%.1f"),
                     calFmt(fts, sizeof(fts), sT, "%.2f"));
       status = (wn < CAL_WIN_MIN_N) ? CAL_E_SHOTS : CAL_E_UNSTABLE;
+      // Ktera podminka neprosla, se ulozi do pole korekce (u neuspechu
+      // nevyuzite): duvod * 1000 + hodnota v desetinach. Displej z toho
+      // napise, proc se kalibrace neprovedla - samotne "neustalilo se"
+      // nerekne, jestli cidlo jen pomalu dobiha, nebo je vadne.
+      if (status == CAL_E_UNSTABLE) {
+        uint8_t why; float val;
+        if (isnan(rms) || rms >= CAL_RESID_MAX)       { why = CALF_NOISE; val = rms; }
+        else if (!isnan(sC) && fabsf(sC) >= CAL_SLOPE_CO2) { why = sC < 0 ? CALF_FALL : CALF_RISE; val = fabsf(sC); }
+        else if (!isnan(sT) && fabsf(sT) >= CAL_SLOPE_T)   { why = CALF_TEMP; val = fabsf(sT); }
+        else                                           { why = CALF_HOLD; val = rms; }
+        long tenths = isnan(val) ? 999 : lroundf(val * 10.0f);
+        if (tenths > 999) tenths = 999;
+        corrExp = (int32_t)why * 1000L + tenths;
+      }
       break;
     }
 
@@ -2858,6 +3002,14 @@ void richPrint(int x, int y, const char *s) {
         display.setCursor(x, y - cap / 2);
         display.print('3');
         display.setFont(curFont);
+      } else {
+        // 9pt uz nema mensi font. Dokreslime '3' 3x5 px u horni hrany,
+        // jinak by v nadpisech grafu zbylo "ug/m ".
+        static const uint8_t g3[5] = { 0b111, 0b001, 0b011, 0b001, 0b111 };
+        int ox = x + 1, oy = y - cap;
+        for (int r = 0; r < 5; r++)
+          for (int c = 0; c < 3; c++)
+            if (g3[r] & (0b100 >> c)) display.drawPixel(ox + c, oy + r, GxEPD_BLACK);
       }
       x += symWidth(*p, cap);
     } else if (n < sizeof(plain) - 1) {
@@ -3124,17 +3276,21 @@ int headerBottom(const Reading &r) {
   return HDR_ROWS_Y + headerRowStep(r) * headerRowCount(r) - 24;
 }
 
-// Zaokrouhli nahoru na "hezke" cislo (1-2-5 x mocnina desiti), aby popisky
-// osy vychazely na kulate hodnoty i u velmi malych rozsahu.
+// Zaokrouhli nahoru na "hezke" cislo, aby popisky osy vychazely na kulate
+// hodnoty i u velmi malych rozsahu. Drive to byla rada 1-2-5: maximum
+// 244 ug/m3 (s rezervou 305) skoncilo na 500 a o neco vetsi na 1000, takze
+// prubeh zabiral tretinu vysky grafu a male hodnoty splynuly s osou. Jemnejsi
+// rada dava osu nejvys o ~25 % vyssi nez potrebnou. Hodnoty jsou volene tak,
+// aby i polovina (popisek uprostred osy) byla kulata.
 static float niceCeil(float v) {
   if (!(v > 0)) return 1.0f;
+  static const float steps[] = { 1.0f, 1.2f, 1.6f, 2.0f, 2.4f, 3.0f, 4.0f,
+                                 5.0f, 6.0f, 8.0f, 10.0f };
   float mag = powf(10.0f, floorf(log10f(v)));
   float n = v / mag;
-  if (n <= 1.0f) n = 1.0f;
-  else if (n <= 2.0f) n = 2.0f;
-  else if (n <= 5.0f) n = 5.0f;
-  else n = 10.0f;
-  return n * mag;
+  for (float st : steps)
+    if (n <= st * 1.0001f) return st * mag;
+  return 10.0f * mag;
 }
 
 // ---------------------------------------------------------------------------
@@ -3213,10 +3369,11 @@ void axisRange(AxisClass ac, float dataMin, float dataMax, bool any,
       //
       // Horni mez se ODVIJI OD DAT, ne od pevneho minima. V cistem vzduchu
       // se meri desetiny ug/m3 a pevny rozsah 0-10 by prubeh slepil s dolni
-      // hranou grafu, takze by nebylo videt vubec nic. Bereme proto 25 %
-      // rezervu nad maximem a zaokrouhlujeme na "hezke" cislo.
+      // hranou grafu, takze by nebylo videt vubec nic. Bereme proto 10 %
+      // rezervu nad maximem (popisky hodnot maji nad prubehem vlastni pruh)
+      // a zaokrouhlujeme na "hezke" cislo.
       mn = 0;
-      mx = any ? niceCeil(dataMax * 1.25f) : 1.0f;
+      mx = any ? niceCeil(dataMax * 1.10f) : 1.0f;
       minSpan = 0.5f;                  // uplne plocha nula je stale citelna
       break;
     default:                           // teploty
@@ -3353,6 +3510,11 @@ void drawPlot(uint8_t pi, int gx, int gy, int gw, int gh) {
     // desetinne misto slepilo vsechny popisky na "0.0".
     bool fine = (axMx[ax] - axMn[ax]) < 2.0f;
     if (ac == AX_CO2)       snprintf(o, n, "%d", (int)lroundf(v));
+    // Velke hodnoty prachu bez desetin: "300.0" je u osy jen sum navic.
+    // Male hodnoty (popisky prubehu, min) si desetinu nechaji - 4.2 a 4 je
+    // u cisteho vzduchu rozdil.
+    else if (ac == AX_PM && (axMx[ax] - axMn[ax]) >= 20.0f && (fabsf(v) >= 20.0f || v == 0.0f))
+      snprintf(o, n, "%d", (int)lroundf(v));
     else if (ac == AX_VBAT) snprintf(o, n, "%.2f", v);
     else if (fine)          snprintf(o, n, "%.2f", v);
     else                    snprintf(o, n, "%.1f", v);
@@ -3376,6 +3538,12 @@ void drawPlot(uint8_t pi, int gx, int gy, int gw, int gh) {
   // identita je dulezitejsi nez cisla.
   const bool legend = (p.n > 1 && !dual);
   const int SEP = 12;
+  // Kdyz ma nektery jiny graf druhou osu Y, je vpravo vedle ramu pruh
+  // RIGHT_AXIS_W, ktery tenhle graf nepouziva. Legenda do nej smi - konci
+  // pak zarovnane s nadpisem druhe osy.
+  int legR = gRight;
+  for (uint8_t i = 0; i < plotCount; i++)
+    if (plotDualAxis(i)) { legR = gRight + RIGHT_AXIS_W; break; }
   char full[MAX_PER_PLOT][32], names[MAX_PER_PLOT][16];
   bool useFull = false;
   int  lw = 0;
@@ -3400,9 +3568,9 @@ void drawPlot(uint8_t pi, int gx, int gy, int gw, int gh) {
     };
     char unitOnly[16];
     snprintf(unitOnly, sizeof(unitOnly), "%s", qUnit(channels[p.first].q));
-    if (gx + richWidth(title) + 10 + legWidth(true) + 4 <= gRight) {
+    if (gx + richWidth(title) + 10 + legWidth(true) + 4 <= legR) {
       useFull = true;
-    } else if (gx + richWidth(unitOnly) + 10 + legWidth(true) + 4 <= gRight) {
+    } else if (gx + richWidth(unitOnly) + 10 + legWidth(true) + 4 <= legR) {
       useFull = true;
       strcpy(title, unitOnly);
     }
@@ -3444,8 +3612,8 @@ void drawPlot(uint8_t pi, int gx, int gy, int gw, int gh) {
       display.print(mm);
     }
   } else {
-    if (titleRight + lw + 4 <= gRight) {
-      int x = gRight - lw - 4;
+    if (titleRight + lw + 4 <= legR) {
+      int x = legR - lw - 4;
       for (uint8_t s = 0; s < p.n; s++) {
         if (s) x += SEP;
         drawStyleSample(x, legY, channels[p.first + s].style);
@@ -3653,6 +3821,12 @@ void drawHint() {
     char buf[72];
     calText(buf, sizeof(buf));
     richPrint(20, HINT_Y, buf);
+    return;
+  }
+  // Spatna varianta cidla CO2 je trvala vada, ne jednorazova zprava -
+  // napoveda k servisu musi ustoupit, dokud cidlo nikdo nevymeni.
+  if (det.scd41 && scdVariantBad()) {
+    richPrint(20, HINT_Y, "POZOR: cidlo CO2 je SCD40, ne SCD41 - nemeri");
     return;
   }
   richPrint(20, HINT_Y, HINT_TEXT);
@@ -3929,13 +4103,16 @@ void svcHelp() {
   Serial.println("  tsrc=<cidlo>  Ktere cidlo dodava hlavni Teplotu (auto = podle priority)");
   Serial.println("  hsrc=<cidlo>  Ktere cidlo dodava hlavni Vlhkost");
   Serial.println("  ch=auto     Automaticky vyber kanalu grafu");
-  Serial.printf ("  ch=a,b,c    Rucni vyber az %d velicin, napr.\n", MAX_CHANNELS);
+  Serial.printf ("  ch=a,b,c    Rucni vyber az %d velicin do %d grafu, napr.\n",
+                 MAX_CHANNELS, MAX_PLOTS);
   Serial.println("              ch=co2,pm25,temp.sht,temp.sen");
   Serial.println("              (velicina konkretniho cidla ma tecku - viz seznam vyse)");
   Serial.printf ("  ch=a+b,c    Plus = do jednoho grafu (nejvys %d krivky,\n", MAX_PER_PLOT);
   Serial.printf ("              pri ruznych jednotkach %d a druha osa Y), napr.\n",
                  MAX_PER_PLOT_MIX);
   Serial.println("              ch=temp.sht+temp.sen,co2");
+  Serial.printf ("              Vic nez %d velicin jde jen se slucovanim, napr.\n", MAX_PLOTS);
+  Serial.println("              ch=temp+temp.ds,hum+hum.bme,co2,press");
   Serial.println("              Pozor: neslucujte veliciny s hodne odlisnym rozsahem");
   Serial.println("              (pokojova + venkovni teplota v zime) - osa se roztahne");
   Serial.println("              a z prubehu nebude videt nic. Delku historie to nemeni.");
@@ -4005,6 +4182,12 @@ void svcList() {
     if (pendingCo2Ref >= 0)
       Serial.printf("  ceka:     co2ref=%d, probehne po exit\n", (int)pendingCo2Ref);
   }
+  if (det.scd41) {
+    if (scdVariant == SCD_VAR_UNKNOWN) Serial.println("  scd4x = varianta neznama");
+    else Serial.printf("  scd4x = %s (0x%04X)\n", scdVariantName(scdVariant), scdVariantRaw);
+    if (scdVariantBad())
+      Serial.println("  POZOR: SCD40 neumi mereni single shot - CO2 nebude merit spravne.");
+  }
   if (det.sen6x) {
     Serial.printf("  cidlo    = %s  sn %s\n",
                   senKindName(senKind), senSerial[0] ? senSerial : "?");
@@ -4032,6 +4215,9 @@ void svcList() {
   // verze firmwaru musi fungovat i se starym konfiguratorem - jinak prestane
   // prebirat vyber kanalu z desky a pri "Pouzit" posle jiny vyber (a deska
   // zalozi novou historii). Slouceni grafu je proto na samostatnem radku.
+  // Kolik velicin a grafu deska unese. Cte to konfigurator, aby nenabizel
+  // vic, nez firmware prijme (starsi verze tenhle radek nemaji = 4 a 4).
+  Serial.printf("  kapacita = %d velicin, %d grafy\n", MAX_CHANNELS, MAX_PLOTS);
   Serial.print ("  ch   = ");
   for (uint8_t c = 0; c < channelCount; c++)
     Serial.printf("%s%s", c ? "," : "", qKey(channels[c].q));
@@ -4083,6 +4269,7 @@ bool chParse(String v, Quantity sel[], bool joi[], uint8_t &n, bool &overflow, S
   n = 0;
   uint8_t inPlot = 0;              // kolik seri uz ma rozdelany panel
   uint8_t plotStart = 0;           // index prvni serie rozdelaneho panelu
+  uint8_t plotsUsed = 0;           // kolik grafu vyber zabere
   int start = 0;
   overflow = false;
 
@@ -4139,6 +4326,15 @@ bool chParse(String v, Quantity sel[], bool joi[], uint8_t &n, bool &overflow, S
           err = e; return false;
         }
       }
+
+      // Velicin muze byt az MAX_CHANNELS, grafu ale jen MAX_PLOTS. Pata
+      // a sesta velicina se proto musi s necim sloucit.
+      if (!cont && plotsUsed >= MAX_PLOTS) {
+        snprintf(e, sizeof(e), "Na displej se vejdou nejvys %u grafy - %s slucte s jinou velicinou (+).",
+                 MAX_PLOTS, part.c_str());
+        err = e; return false;
+      }
+      if (!cont) plotsUsed++;
 
       sel[n] = q; joi[n] = cont;
       if (!cont) { plotStart = n; inPlot = 1; } else inPlot++;
@@ -4454,7 +4650,19 @@ bool svcHandle(String line, bool &dirty) {
   return false;
 }
 
+// Definice je az za raw stringem AP_PAGE (sekce WIFI HOTSPOT). Pro funkce za
+// nim Arduino IDE prototypy negeneruje, proto deklarace rucne.
+void renderServiceScreen();
+
 void runService() {
+  // Nejdriv displej - konfigurator ceka na vypis, ale ten jde po USB hned,
+  // kdezto cele prekresleni trva asi 2 s a clovek se jinak diva na stara
+  // data a nevi, jestli se servis vubec spustil.
+  SPI.begin(EPD_CLK, EPD_MISO, EPD_MOSI, EPD_CS);
+  display.init(115200, true, 2, false);
+  renderServiceScreen();
+  display.powerOff();
+
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 3000) delay(10);
   svcHelp();
@@ -4632,6 +4840,8 @@ min-height:34px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 <div class="r hd" id="rAsc"><label>Automatická samokalibrace</label>
 <input type=checkbox id=asc style="width:20px;height:20px;accent-color:var(--ac)"></div>
 <p class="wn hd" id="ascwn"></p>
+<div class="r"><label>Nadmořská výška [m]</label>
+<input type=number id=alt2 step=10 min=0 max=4000></div>
 <div class="r"><label>Kalibrovat na hodnotu [ppm]</label>
 <input type=number id=co2ref step=5 min=300 max=2000 value=420></div>
 <div class="r"><label>Odklad startu [s] - čas odnést desku</label>
@@ -4645,6 +4855,8 @@ a teprve potom se kalibruje. Průběh i výsledek uvidíte na displeji. Venku ve
 stínu na čerstvém vzduchu odpovídá 420 ppm. Kalibrace přežije odpojení
 napájení, takže stačí jednou za čas.</p>
 <p class="n" id="calst"></p>
+<p class="wn hd" id="scdw">Na desce je SCD40, ne SCD41. SCD40 neumí měření single shot,
+které deska používá, a CO₂ s ním měřit nebude. Čidlo vyměňte za SCD41.</p>
 <div class="acts hd" id="rReset"><button class="dg" onclick="resetCo2(this)">Obnovit tovární kalibraci</button></div>
 <p class="n hd" id="resetH">Smaže všechny dosavadní kalibrace SCD41 a vrátí výrobní. Hodí
 se, když se kalibrace pokazila: čidlo pak hned ukáže, co měří bez nich.</p>
@@ -4706,7 +4918,9 @@ už by neplatily.</p>
 <div class="p"><h2>Veličiny v grafu</h2><div class="b">
 <p class="n" style="margin:0 0 10px">Kromě hlavní teploty a vlhkosti jde do grafu
 dát i každé čidlo zvlášť - třeba teplotu ze SHT40 a ze SEN63C vedle sebe.
-Veličiny se stejným číslem grafu se nakreslí do jednoho grafu.</p>
+Veličiny se stejným číslem grafu se nakreslí do jednoho grafu.
+Vybrat jde až 6 veličin, grafy jsou ale nejvýš 4 - pátou a šestou je potřeba
+sloučit s jinou.</p>
 <div class="r"><label>Vybrat automaticky</label>
 <input type=checkbox id=auto onchange="qUpd()" style="width:20px;height:20px;accent-color:var(--ac)"></div>
 <div class="q" id="qg" style="margin-top:10px"></div>
@@ -4749,10 +4963,10 @@ if(!j||j.error)throw new Error(j&&j.error||"err");
 S=j;draw();if(b)ok(b,l||"Hotovo ✓");if(cb)cb(j)})
 .catch(function(e){var m=e&&e.message||String(e);
 toast(m.indexOf("http 500")>=0?"Uložení selhalo!":(/^(http|err$)|fetch|network/i.test(m)?"Chyba spojení":m),1)})}
-// Deska uklada nejvyse MAX_CHANNELS veliciny. Kdyby se tady pocitalo s vic,
+// Deska uklada nejvyse MAX_CHANNELS velicin v MAX_PLOTS grafech. Kdyby se tady pocitalo s vic,
 // ukazovala by stranka delku historie, ktera nikdy nenastane - firmware
 // v /api/set stejne prebere jen prvnich MAXCH.
-var MAXCH=4;
+var MAXCH=6,MAXPL=4;
 function nch(){if(g("auto").checked)return S.autoCount||2;
 var n=0;Q.forEach(function(q){var e=g("q_"+q.k);if(e&&e.checked)n++});
 return Math.min(n||1,MAXCH)}
@@ -4807,7 +5021,10 @@ function applyCo2(b){req("/api/set?asc="+(g("asc").checked?1:0),b,"Použito ✓"
 function calCo2(b){var v=+g("co2ref").value||420,d=+g("caldelay").value;
 if(v<300||v>2000){toast("Rozsah 300 až 2000 ppm",1);return}
 if(isNaN(d)||d<0||d>600){toast("Odklad 0 až 600 s",1);return}
-req("/api/set?co2ref="+v+"&caldelay="+Math.round(d),b,"Naplánováno ✓")}
+// Vyska patri ke kalibraci (bez ni cidlo pocita s tlakem u more), proto je
+// i tady a posila se spolu s ni. Stejna hodnota je v panelu Kompenzace.
+var a=+g("alt2").value;if(isNaN(a)||a<0||a>4000){toast("Výška 0 až 4000 m",1);return}
+req("/api/set?alt="+Math.round(a)+"&co2ref="+v+"&caldelay="+Math.round(d),b,"Naplánováno ✓")}
 function applySen(b){req("/api/set?senwarm="+(+g("senwarm").value||30)
 +"&senmult="+SM+"&senauto="+(+g("senauto").value||0)
 +"&lsleep="+(g("lsleep").checked?1:0),b,"Použito ✓")}
@@ -4815,6 +5032,7 @@ function draw(){g("vS").textContent=S.sensors||"—";g("vI").textContent=S.inter
 g("vH").textContent=S.count+"/"+S.perCh;g("vB").textContent=(S.vbat||0).toFixed(2)+" V";
 g("vF").textContent="v"+(S.fw||"?");
 ["poff","alt"].forEach(function(k){if(document.activeElement!==g(k))g(k).value=S[k]});
+if(document.activeElement!==g("alt2"))g("alt2").value=S.alt;
 offRows("toffs",S.toffs||[],"t","°C",.1,20);offRows("hoffs",S.hoffs||[],"h","%RH",.5,30);
 var hasP=(S.srcP||"-")!=="-",hasC=(S.srcC||"-")!=="-";
 // Vyska: s barometrem prepocet tlaku na hladinu more, bez nej kompenzace CO2.
@@ -4838,6 +5056,7 @@ g("calst").textContent=(S.calPend?"Naplánováno: "+S.calPend+" ppm na "+S.calSe
 +" - začne po vypnutí hotspotu a odkladu "+S.calDelay+" s. ":"")+(S.cal?"Poslední: "+S.cal:"")
 +(S.calWarn?" "+S.calWarn:"");
 var isScd=(S.srcC==="SCD41");g("rReset").className=isScd?"acts":"acts hd";
+g("scdw").className=(S.scdVar==="SCD40")?"wn":"wn hd";
 g("resetH").className=isScd?"n":"n hd";
 g("sT").textContent=S.srcT||"—";g("sH").textContent=S.srcH||"—";
 g("sC").textContent=S.srcC||"—";g("sP").textContent=S.srcP||"—";
@@ -4866,10 +5085,10 @@ Q.forEach(function(q){var e=g("q_"+q.k);if(e&&e.checked)on.push(q.k)});
 ORD=ORD.filter(function(k){return on.indexOf(k)>=0});
 on.forEach(function(k){if(ORD.indexOf(k)<0)ORD.push(k)});
 ORD.forEach(function(k){if(!GR[k]){var u=ORD.map(function(x){return GR[x]}),n=1;
-while(u.indexOf(n)>=0&&n<MAXCH)n++;GR[k]=n}});
+while(u.indexOf(n)>=0&&n<MAXPL)n++;GR[k]=n}});
 Q.forEach(function(q){var s=g("g_"+q.k);if(!s)return;var c=on.indexOf(q.k)>=0;
 s.className=(a||!c)?"hd":"";if(c)s.value=GR[q.k]||1});
-var gs=[],err="",wrn="";for(var n=1;n<=MAXCH;n++){
+var gs=[],err="",wrn="";for(var n=1;n<=MAXPL;n++){
 var m=ORD.filter(function(k){return (GR[k]||1)===n});if(m.length)gs.push(m)}
 gs.forEach(function(m){var cl={};m.forEach(function(k){cl[axc(k)]=1});
 var mx=Object.keys(cl).length>1,lim=mx?2:3;
@@ -4903,7 +5122,7 @@ req("/api/set?"+p.join("&"),b,"Použito ✓")}
 // z ktereho deska tise pouzije jen prvnich MAXCH.
 function qPick(el){
 var n=0;Q.forEach(function(q){var e=g("q_"+q.k);if(e&&e.checked)n++});
-if(n>MAXCH){el.checked=false;toast("Nejvýše "+MAXCH+" veličiny",1)}
+if(n>MAXCH){el.checked=false;toast("Nejvýše "+MAXCH+" veličin",1)}
 if(!el.checked)delete GR[el.id.slice(2)];
 plan();calc()}
 function applyCh(b){var s="auto";
@@ -5100,6 +5319,9 @@ String apStatusJson(float vbat) {
     j += "\"calWarn\":\"" + String(calWarnText()) + "\",";
     j += "\"calSen\":\"" + String(calSensorName() ? calSensorName() : "") + "\",";
   }
+  // Varianta SCD4x: "SCD40" je spatne (neumi single shot), "" = neznama.
+  if (det.scd41)
+    j += "\"scdVar\":\"" + String(scdVariant == SCD_VAR_UNKNOWN ? "" : scdVariantName(scdVariant)) + "\",";
   j += "\"chAuto\":" + String(cfg.chAuto) + ",";
   j += "\"autoCount\":" + String(channelCount) + ",";
   j += "\"channels\":[";
@@ -5173,6 +5395,52 @@ void drawQr(const char *text, int x0, int y0, int scale) {
     for (uint8_t x = 0; x < qr.size; x++)
       if (qrcode_getModule(&qr, x, y))
         display.fillRect(x0 + x * scale, y0 + y * scale, scale, scale, GxEPD_BLACK);
+}
+
+// Obrazovka servisniho rezimu (USB). Bez ni displej ukazoval posledni mereni
+// a nebylo poznat, ze deska ceka na konfigurator a nemeri.
+void renderServiceScreen() {
+  display.setRotation(3);
+  display.setTextColor(GxEPD_BLACK);
+  display.setTextWrap(false);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+
+    useFont(&FreeSansBold18pt7b);
+    display.setCursor(20, 50);
+    display.print("Servisni rezim");
+    useFont(&FreeSans12pt7b);
+    display.setCursor(20, 84);
+    display.print("nastaveni pres USB");
+    display.drawFastHLine(20, 100, W - 40, GxEPD_BLACK);
+
+    useFont(&FreeSans9pt7b);
+    display.setCursor(20, 140);
+    display.print("Na pocitaci otevrete v Chrome nebo Edge");
+    useFont(&FreeSansBold12pt7b);
+    display.setCursor(20, 172);
+    display.print("meteoeink.chiptron.cz");
+    useFont(&FreeSans9pt7b);
+    display.setCursor(20, 204);
+    display.print("a kliknete na Pripojit desku.");
+
+    display.setCursor(20, 252);
+    display.print("Deska ted nemeri, ceka na nastaveni.");
+
+    display.drawFastHLine(20, H - 112, W - 40, GxEPD_BLACK);
+    display.setCursor(20, H - 88);
+    display.print("Konec: Ulozit a ukoncit servis,");
+    char buf[64];
+    snprintf(buf, sizeof(buf), "nebo samo po %lu s necinnosti.",
+             (unsigned long)(SERVICE_TIMEOUT_MS / 1000UL));
+    display.setCursor(20, H - 66);
+    display.print(buf);
+    display.setCursor(20, H - 40);
+    display.print("Pak deska pokracuje v mereni.");
+    drawFooter();
+  } while (display.nextPage());
 }
 
 void renderApScreen() {
