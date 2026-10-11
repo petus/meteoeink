@@ -12,7 +12,7 @@ Podrobný článek: <https://chiptron.cz/prenosna-offline-meteostanice-s-jednodu
 
 - Měří teplotu, vlhkost, CO₂, prach (PM2.5 / PM10) a tlak - podle toho, jaká čidla jsou připojená.
 - **Čidla se detekují automaticky** při startu. Připojení nebo odebrání čidla nevyžaduje překompilování firmwaru.
-- Vykresluje aktuální hodnoty a až **4 grafy historie** přímo na e-ink displej.
+- Vykresluje aktuální hodnoty a až **4 grafy historie** přímo na e-ink displej, se slučováním až 6 veličin.
 - **Každé čidlo má vlastní veličinu**, takže jde porovnat třeba teplotu ze SHT40 a ze SEN63C - buď každou ve svém grafu, nebo obě v jednom. Zároveň si volíte, které čidlo dodává hlavní hodnotu na displeji.
 - Historie se ukládá lokálně a **přežije vybití i restart** (RTC RAM + NVS).
 - Mezi měřeními je deska v deep sleepu - při rozumném intervalu vydrží baterie týdny.
@@ -25,7 +25,7 @@ Podrobný článek: <https://chiptron.cz/prenosna-offline-meteostanice-s-jednodu
 | SHT4x | teplota, vlhkost | I2C 0x44 / 0x45 / 0x46 (základní, je na desce) |
 | SEN63C / SEN66 | PM1/2.5/4/10, teplota, vlhkost, CO₂ | I2C 0x6B |
 | SEN65 / SEN68 / SEN69C | PM, teplota, vlhkost (+ CO₂ u 69C) | I2C 0x6B, volitelná knihovna |
-| SCD41 | CO₂ | I2C 0x62 |
+| SCD41 | CO₂ | I2C 0x62 (SCD40 nefunguje, neumí single shot, firmware na něj upozorní) |
 | BME280 | tlak (+ vlhkost záložně) | I2C 0x76 / 0x77 |
 | BMP280 | tlak | I2C 0x76 / 0x77 |
 | DS18B20 | druhá teplota | 1-Wire, GPIO4 + pull-up 4,7 kΩ |
@@ -36,13 +36,13 @@ I2C čidla se připojují konektorem **uSup** (kompatibilní se SparkFun Qwiic /
 
 ### Délka historie
 
-Paměť je společný pool - čím méně kanálů grafu a delší interval, tím delší historie. Rozhoduje počet **kanálů**, ne počet grafů: sloučení dvou veličin do jednoho grafu historii neprodlouží.
+Paměť je společný pool - čím méně veličin a delší interval, tím delší historie. Rozhoduje počet **veličin**, ne počet grafů: sloučení dvou veličin do jednoho grafu historii neprodlouží. Pátá a šestá veličina jde jen se slučováním, grafy jsou nejvýš čtyři.
 
-| Interval | 1 kanál | 2 kanály | 3 kanály | 4 kanály |
-|---|---|---|---|---|
-| 5 min | 7 dní | 4,5 dne | 3 dny | 2,2 dne |
-| 30 min | 42 dní | 27 dní | 18 dní | 13,5 dne |
-| 60 min | 84 dní | 54 dní | 36 dní | 27 dní |
+| Interval | 1 veličina | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| 5 min | 7 dní | 4,5 dne | 3 dny | 2,2 dne | 1,8 dne | 1,5 dne |
+| 30 min | 42 dní | 27 dní | 18 dní | 13,5 dne | 10,8 dne | 9 dní |
+| 60 min | 84 dní | 54 dní | 36 dní | 27 dní | 21,6 dne | 18 dní |
 
 > **Pozor:** zařízení není určené do venkovního prostředí. Elektronika ani baterie nejsou chráněné proti vlhkosti a mrazu. Venkovní teplotu měřte čidlem DS18B20 v radiačním štítu, jednotka zůstane uvnitř.
 
@@ -122,7 +122,16 @@ FRC zapíše rozdíl mezi tím, co čidlo ukazuje *právě teď*, a referencí. 
 | podmínky platí nepřetržitě | ≥ 60 s |
 | doba měření | 3 až 20 min |
 
-Když se hodnoty do 20 minut neustálí (kolem desky chodí lidé, ohřívá ji slunce), kalibrace se neprovede a displej ukáže *neustalilo se*.
+Když se hodnoty do 20 minut neustálí, kalibrace se neprovede a displej napíše, která podmínka neprošla:
+
+| Na displeji | Co to znamená |
+|---|---|
+| *rozptyl 48 ppm* | jednotlivá měření skáčou víc, než má zdravé čidlo (typicky ±10 ppm). U SCD41 zkuste obnovit tovární kalibraci, pokud měření skáče dál, čidlo je nejspíš vadné |
+| *CO2 klesa* / *CO2 stoupa* | čidlo ještě dobíhá, dejte delší odklad nebo desku nechte venku déle |
+| *meni se teplota* | deska se ohřívá nebo chladne, dejte ji do stínu |
+| *hodnoty kolisaji* | podmínky se chvíli splnily a zase rozpadly, typicky vítr nebo lidé kolem |
+
+Konfigurátor i hotspot k tomu ukážou delší vysvětlení.
 
 Obvyklá doba je 5 až 15 minut. SCD41 se při měření každých 5 s sám ohřívá, takže i když je deska venku předem, čeká se na ustálení teploty čidla, typicky 6 minut.
 
@@ -169,7 +178,9 @@ Celé to trvá asi dvě minuty.
 
 **Přes WiFi (telefon):** při restartu podržte tlačítko **PUSH** déle než 5 s. Deska vytvoří zabezpečený hotspot `MeteoEink-XXXX` a na displeji ukáže SSID, heslo a QR kód pro připojení. Hotspot se po 5 minutách nečinnosti sám vypne, aby nevybíjel baterii.
 
-Nastavit lze interval měření, kalibrační offsety jednotlivých čidel, které čidlo dodává hlavní teplotu a vlhkost, a které veličiny se kreslí do grafů. Každá vybraná veličina má volbu *Graf 1* až *Graf 4*: veličiny se stejným číslem se nakreslí do jednoho grafu (stejné jednotky až tři křivky, různé jednotky dvě a druhá osa Y). Přeskládání grafů historii nesmaže, přidání nebo odebrání veličiny ano.
+Nastavit lze interval měření, kalibrační offsety jednotlivých čidel, které čidlo dodává hlavní teplotu a vlhkost, a které veličiny se kreslí do grafů. Vybrat jde až 6 veličin. Každá má volbu *Graf 1* až *Graf 4*: veličiny se stejným číslem se nakreslí do jednoho grafu (stejné jednotky až tři křivky, různé jednotky dvě a druhá osa Y). Šest veličin se tak vejde třeba jako vnitřní + venkovní teplota, vnitřní + venkovní vlhkost, CO₂ a tlak. Přeskládání grafů historii nesmaže, přidání nebo odebrání veličiny ano.
+
+V servisním režimu přes USB ukáže displej obrazovku *Servisni rezim* s adresou konfigurátoru, deska mezitím neměří.
 
 ### 3. Tlačítka (držet při restartu)
 
@@ -231,9 +242,9 @@ Soubor je rozdělený komentářovými hlavičkami na sekce, v tomto pořadí:
 Klíčové věci, které je dobré znát před úpravami:
 
 - **Arduino IDE vkládá vygenerované prototypy těsně před první definici funkce v souboru.** Když se typ použitý v hlavičce funkce (`Quantity`, `Reading`, `Detected`, `SenKind`, ...) definuje až za tou první funkcí, překlad spadne na desítkách hlášek `'Quantity' was not declared in this scope`. **V souboru nesmí být žádná definice funkce dřív než blok typů v sekci VELIČINY A ČIDLA.** Čistý `g++` tuhle chybu neodhalí.
-- **Kanál vs. panel.** Kanál je jedna veličina v historii, panel je jeden rám grafu. Do v4.3 to bylo 1:1, od v4.4 může panel nést až tři kanály. Rozdělení dělá `buildPlots()`, sloučit lze jen sousední kanály, takže panel je prostě rozsah v `channels[]`. Seskupení se veze v horním bitu `cfg.chSel[]` a **nevstupuje do `buildSignature()`**. Pořadí kanálů v podpisu je a sloučení ho často mění. Když jde jen o jiné pořadí stejných veličin, `histPermute()` přehodí bloky v poolu a historie se hned uloží do NVS pod novým podpisem. Výběr kanálů rozebírá pro servis i hotspot jedna funkce, `chParse()`.
+- **Kanál vs. panel.** Kanál je jedna veličina v historii, panel je jeden rám grafu. Do v4.3 to bylo 1:1, od v4.4 může panel nést až tři kanály a od v4.5 je kanálů až `MAX_CHANNELS` (6) v nejvýš `MAX_PLOTS` (4) panelech. Rozdělení dělá `buildPlots()`, sloučit lze jen sousední kanály, takže panel je prostě rozsah v `channels[]`. Seskupení se veze v horním bitu `cfg.chSel[]` a **nevstupuje do `buildSignature()`**. Pořadí kanálů v podpisu je a sloučení ho často mění. Když jde jen o jiné pořadí stejných veličin, `histPermute()` přehodí bloky v poolu a historie se hned uloží do NVS pod novým podpisem. Výběr kanálů rozebírá pro servis i hotspot jedna funkce, `chParse()`.
 - **Historie** žije v `RTC_DATA_ATTR int16_t histPool[POOL_SLOTS]` jako společný kruhový pool. Kanál `c` zabírá rozsah `histPool[c*histPerCh ... c*histPerCh + histPerCh-1]`, `histPerCh` se dopočítává z počtu aktivních kanálů. RTC RAM přežije deep sleep; do NVS se zapisuje jen každé `NVS_SAVE_EVERY` měření, aby se šetřilo flash.
-- **Konfigurace** je struktura `Config` v NVS (namespace `meteo`, klíč `cfg`), chráněná hodnotou `CFG_MAGIC`. Když strukturu změníte, změňte i magic - stará konfigurace se pak ignoruje místo toho, aby se přečetla špatně. `cfgSanitize()` ošetřuje nesmyslné hodnoty, `cfgSave()` po zápisu ověřuje zpětným čtením.
+- **Konfigurace** je struktura `Config` v NVS (namespace `meteo`, klíč `cfg`), chráněná hodnotou `CFG_MAGIC`. Když strukturu změníte, změňte i magic - stará konfigurace se pak ignoruje místo toho, aby se přečetla špatně. Výjimkou je `MEK7` (do v4.4, 4 kanály), kterou `cfgLoad()` převede na `MEK8`. O verzi rozhoduje magic, ne délka záznamu: obě struktury mají kvůli zarovnání stejnou velikost. `cfgSanitize()` ošetřuje nesmyslné hodnoty, `cfgSave()` po zápisu ověřuje zpětným čtením.
 - **Zdroje veličin.** Teplotu a vlhkost hlásí až pět čidel. Offsety se přičítají na jednom místě v `mergeSources()`, ne v jednotlivých čtecích funkcích. Které čidlo je hlavní, odpovídá výhradně `tsrcPrimary()` / `hsrcPrimary()` - nikdy dostupnost čidel.
 - **Ochrana historie**: v NVS je podpis sestavy (čidla + kanály + interval). Při neshodě se historie hned nemaže - odlišná sestava se musí potvrdit dvěma po sobě jdoucími starty (`SIG_CONFIRM`), aby výpadek čidla nesmazal data.
 - **Ochrana baterie**: pod `VBAT_LOW` (3,50 V) se na displeji zobrazí varování, pod `VBAT_NO_WRITE` (3,30 V) se přestane zapisovat do flash. Pod `SEN_VBAT_MIN` (3,45 V) se vůbec nespustí SEN6x.
@@ -242,7 +253,8 @@ Klíčové věci, které je dobré znát před úpravami:
 Nejdůležitější konstanty na jednom místě v sekci `LIMITY A VÝCHOZÍ HODNOTY`:
 
 ```c
-#define MAX_CHANNELS      4      // max. počet veličin v grafech
+#define MAX_CHANNELS      6      // max. počet veličin v historii
+#define MAX_PLOTS         4      // max. počet grafů na displeji
 #define MAX_PER_PLOT      3      // max. křivek v jednom grafu
 #define MAX_PER_PLOT_MIX  2      // totéž při různých jednotkách (dvě osy Y)
 #define POOL_SLOTS        2592   // 5184 B v RTC RAM

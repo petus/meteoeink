@@ -1,5 +1,72 @@
 # MeteoEink426 - changelog
 
+## v4.5.1
+
+Konfigurace i historie zůstávají.
+
+- **Opraveno: osa prachu byla zbytečně vysoká.** Horní mez se zaokrouhlovala
+  řadou 1-2-5 s rezervou 25 %, takže maximum 244 µg/m³ dalo osu 500 a o něco
+  vyšší hodnoty 1000. Průběh pak zabral třetinu až polovinu výšky grafu
+  a malé hodnoty splynuly s osou. Nově je rezerva 10 % a jemnější řada
+  (1; 1,2; 1,6; 2; 2,4; 3; 4; 5; 6; 8; 10), takže průběh zabírá kolem 80 %
+  výšky: 244 µg/m³ dá osu 300, 401 µg/m³ osu 500.
+- **Popisky osy prachu bez zbytečných desetin.** Od rozsahu 20 µg/m³ se
+  velké hodnoty píšou celým číslem („300“ místo „300.0“). Malé hodnoty
+  v popiscích průběhu a v min/max desetinu nechávají.
+
+---
+
+## v4.5.0
+
+Konfigurace i historie zůstávají. `CFG_MAGIC` je nově `MEK8`, konfiguraci
+`MEK7` z v4.4 firmware při načtení převede.
+
+### Nové
+
+- **Až 6 veličin ve 4 grafech.** Limit veličin (`MAX_CHANNELS`) je 6, limit
+  grafů (`MAX_PLOTS`) zůstává 4. Pátá a šestá veličina jde jen sloučením
+  s jinou, třeba `temp+temp.ds,hum+hum.bme,co2,press`. Parser, konfigurátor
+  i hotspot víc než 4 grafy odmítnou, automatický výběr bere dál nejvýš 4
+  veličiny. Historie se dělí mezi veličiny, při 6 a intervalu 5 min vychází
+  na 1,5 dne. `Config.chSel` se zvětšil na 6 položek a magic na `MEK8`;
+  konfigurace `MEK7` se při načtení převede. Obě struktury mají kvůli
+  zarovnání stejnou velikost, o verzi proto rozhoduje magic, ne délka záznamu.
+  `list` vypisuje nový řádek `kapacita = 6 velicin, 4 grafy`; konfigurátor
+  podle něj nabízí 6 veličin, bez něj (starší build) 4.
+- **Obrazovka servisního režimu.** Po vstupu do servisu přes USB ukáže displej
+  *Servisni rezim*, adresu konfigurátoru a jak servis ukončit. Dřív zůstala
+  na displeji poslední data a nebylo poznat, že deska čeká a neměří.
+- **Kontrola varianty SCD4x.** Při detekci se čte `get_sensor_variant`
+  (0x202F). SCD40 neumí single shot, který deska používá, a s CO₂ nefunguje.
+  Na trhu se občas prodává jako SCD41. Když se na 0x62 najde SCD40,
+  upozorní na to sériová linka, `list`, konfigurátor, hotspot a místo
+  nápovědy i displej. Kus, který příkaz nezná, se hlásí jako neznámá varianta
+  bez varování.
+
+### Kalibrace CO₂
+
+- **Proč se kalibrace neustálila.** Místo samotného *neustalilo se* displej
+  napíše podmínku, která na konci neprošla: *rozptyl 48 ppm*, *CO2 klesa*,
+  *CO2 stoupa*, *meni se teplota* nebo *hodnoty kolisaji*. `list`,
+  konfigurátor i hotspot k tomu ukážou vysvětlení. U rozptylu radí obnovit
+  tovární kalibraci a upozorní, že čidlo je nejspíš vadné. Důvod se ukládá do
+  pole korekce v `CalResult` (`CALF_*` × 1000 + hodnota v desetinách), záznam
+  v NVS tak nemění velikost.
+- **Nadmořská výška vedle kalibrace.** Na stránce hotspotu je výška nově
+  i v panelu CO₂ a posílá se spolu s kalibrací. V konfigurátoru na ni
+  upozorňuje nápověda kalibrace. Výška je pro kalibraci potřeba a v panelu
+  Kompenzace ji hledal málokdo.
+
+### Opravy
+
+- **Horní index v nadpisech grafů.** `µg/m³` se v písmu 9 pt kreslilo bez
+  trojky, protože menší font není. Trojka se teď dokreslí z pixelů 3×5.
+- **Legenda sloučeného grafu se nevešla vedle grafu se dvěma osami.** Když
+  má jiný graf druhou osu Y, smí teď legenda využít její pruh vpravo, takže
+  se vejdou i min a max.
+
+---
+
 ## v4.4.0
 
 Konfigurace i historie zůstávají (`CFG_MAGIC` je pořád `MEK7`).
@@ -19,12 +86,15 @@ Konfigurace i historie zůstávají (`CFG_MAGIC` je pořád `MEK7`).
 
   Stejné jednotky sdílejí jednu osu (nejvýš tři křivky), různé jednotky
   dostanou druhou osu Y vpravo (nejvýš dvě křivky). Křivky se rozlišují stylem
-  čáry (plná, čárkovaná, tečkovaná) a popiskem na konci. Graf má víc místa:
-  čtyři veličiny ve dvou grafech mají 231 px na výšku místo 94 px.
+  čáry (plná, čárkovaná, tečkovaná). Legenda je nad rámem grafu: ukázka čáry,
+  jméno čidla a u společné osy min a max každého čidla, např.
+  `°C  ─── SHT40 19.8..23.8  -- SEN63C 21.1..25.5`. Aby se čísla vešla, zkrátí
+  se nadpis na jednotku; u tří křivek zůstanou jen jména. Do plochy grafu se
+  nic nepíše, takže legenda nezakrývá poslední naměřené hodnoty. Graf má víc
+  místa: čtyři veličiny ve dvou grafech mají 231 px na výšku místo 94 px.
+  Grafy s jednou veličinou se kreslí stejně jako ve v4.3.2.
 
-  Slučuje se jen na výslovné přání, automatický výběr kanálů to nedělá. Když
-  je společný rozsah osy víc než trojnásobkem rozsahu nejširší z křivek
-  (třeba pokojová a venkovní teplota v zimě), napíše se to do záhlaví grafu.
+  Slučuje se jen na výslovné přání, automatický výběr kanálů to nedělá.
 
   V konfigurátoru i na stránce hotspotu má každá vybraná veličina volbu
   *Graf 1* až *Graf 4*, veličiny se stejným číslem jdou do jednoho grafu.
@@ -103,7 +173,10 @@ Kalibrace (FRC) dřív u SCD41 nefungovala vůbec a u obou čidel zapisovala
 - **První vzorek po servisu nebo hotspotu neukládá teplotu a vlhkost
   z čidel na desce.** Deska byla minuty vzhůru, často na nabíjejícím USB,
   a SHT40 bylo ohřáté o ~4 °C. V grafu je místo špičky mezera. Čidla na
-  kabelu se ukládají normálně.
+  kabelu se ukládají normálně. Když je to po smazání historie jediný vzorek,
+  graf místo prázdné křivky napíše *ceka na dalsi mereni* (ve sloučeném
+  grafu se jménem čidla). Totéž platí pro SEN6x v cyklu přeskočeném kvůli
+  `senmult`.
 - **Osa vlhkosti jednotlivých čidel.** `hum.sht` až `hum.bme` dostávaly
   rozsah osy jako teplota (minimální rozpětí 2 místo 5 %RH), takže šum
   vypadal jako velký výkyv. Třídu osy teď určuje jedno místo, `qAxisClass()`.
